@@ -57,12 +57,14 @@ import com.google.devtools.build.lib.util.TempPathGenerator;
 import com.google.devtools.build.lib.vfs.FileStatus;
 import com.google.devtools.build.lib.vfs.FileSymlinkLoopException;
 import com.google.devtools.build.lib.vfs.FileSystem;
+import com.google.devtools.build.lib.vfs.FileSystem.NotASymlinkException;
 import com.google.devtools.build.lib.vfs.FileSystemUtils;
 import com.google.devtools.build.lib.vfs.OutputPermissions;
 import com.google.devtools.build.lib.vfs.Path;
 import com.google.devtools.build.lib.vfs.PathFragment;
 import com.google.devtools.build.lib.vfs.Symlinks;
 import io.reactivex.rxjava3.core.Completable;
+import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -81,6 +83,47 @@ import javax.annotation.Nullable;
  */
 public abstract class AbstractActionInputPrefetcher implements ActionInputPrefetcher {
   private static final GoogleLogger logger = GoogleLogger.forEnclosingClass();
+
+  /** A file system that can safely materialize its logical paths on the host file system. */
+  interface ExternalRepositoryOverlay {
+    @Nullable
+    HostMaterialization getHostMaterialization(Path path) throws IOException;
+  }
+
+  /** The host path prepared for a content check and whether that check requires a download. */
+  record PreparedDownloadTarget(Path path, boolean downloadRequired) {}
+
+  /** Host-side work needed to make a logical overlay path available to a local process. */
+  interface HostMaterialization {
+    /** Returns the fully resolved path that contains the input's contents. */
+    Path getResolvedPath();
+
+    /**
+     * Makes the resolved target safe to inspect or replace on the host.
+     *
+     * <p>The callback runs while overlay coordination is held, after stale host ancestors have been
+     * repaired.
+     */
+    PreparedDownloadTarget prepareDownloadTarget(HostPathChecker checker) throws IOException;
+
+    /**
+     * Reprepares the resolved target and runs {@code finalizer} while holding overlay coordination.
+     */
+    void finalizeDownload(HostFinalizer finalizer) throws IOException;
+
+    /** Reproduces the overlay symlink trace on the host file system. */
+    void materializeSymlinks() throws IOException;
+  }
+
+  @FunctionalInterface
+  interface HostFinalizer {
+    void run() throws IOException;
+  }
+
+  @FunctionalInterface
+  interface HostPathChecker {
+    boolean run(Path path) throws IOException;
+  }
 
   private final Reporter reporter;
   private final AsyncTaskCache.NoResult<Path> downloadCache = AsyncTaskCache.NoResult.create();
@@ -434,10 +477,21 @@ public abstract class AbstractActionInputPrefetcher implements ActionInputPrefet
       if (metadata == null) {
         return immediateVoidFuture();
       }
-      var symlinks = getSymlinks(input, inputPath, metadata, metadataSupplier);
+      @Nullable HostMaterialization hostMaterialization = getHostMaterialization(inputPath);
+      var symlinks =
+          hostMaterialization == null
+              ? getSymlinks(input, inputPath, metadata, metadataSupplier)
+              : ImmutableList.<Symlink>of();
       // On Windows, the type of symlink depends on the target file and the target may have to
       // exist, so we plant symlinks in reverse order and only after any download has completed.
-      var plantSymlinks = concat(Lists.transform(symlinks.reverse(), this::plantSymlink));
+      var plantSymlinks =
+          hostMaterialization != null
+              ? Completable.defer(
+                  () -> {
+                    hostMaterialization.materializeSymlinks();
+                    return Completable.complete();
+                  })
+              : concat(Lists.transform(symlinks.reverse(), this::plantSymlink));
 
       if (!canDownloadFile(inputPath, metadata)) {
         // If the artifact is a declared ("unresolved") symlink, it can't be "downloaded", but the
@@ -445,7 +499,9 @@ public abstract class AbstractActionInputPrefetcher implements ActionInputPrefet
         return toListenableFuture(plantSymlinks);
       }
 
-      if (!symlinks.isEmpty()) {
+      if (hostMaterialization != null) {
+        inputPath = hostMaterialization.getResolvedPath();
+      } else if (!symlinks.isEmpty()) {
         // Symlink may track the parent of a TreeFileArtifact, so the parent relative path has to be
         // translated relative to it.
         var parentRelativePath = inputPath.relativeTo(symlinks.getFirst().linkPath());
@@ -468,13 +524,22 @@ public abstract class AbstractActionInputPrefetcher implements ActionInputPrefet
                   input,
                   metadata,
                   priority,
-                  reason)
+                  reason,
+                  hostMaterialization)
               .andThen(plantSymlinks);
 
       return toListenableFuture(result);
     } catch (IOException | InterruptedException e) {
       return immediateFailedFuture(e);
     }
+  }
+
+  @Nullable
+  private static HostMaterialization getHostMaterialization(Path inputPath) throws IOException {
+    if (inputPath.getFileSystem() instanceof ExternalRepositoryOverlay overlay) {
+      return overlay.getHostMaterialization(inputPath);
+    }
+    return null;
   }
 
   /**
@@ -542,8 +607,18 @@ public abstract class AbstractActionInputPrefetcher implements ActionInputPrefet
       }
       return getSymlinks(treeArtifact, treeArtifact.getPath(), treeMetadata, metadataSupplier);
     }
-    if ((metadata.isRemote() || metadata.getType() == FileStateType.SYMLINK)
-        && !inputPath.startsWith(execRoot)) {
+    boolean isExternal = !inputPath.startsWith(execRoot);
+    // Following a logical external symlink can produce regular-file metadata for its local target,
+    // even if a stale native entry shadows the link on the host file system.
+    boolean isLogicalExternalSymlink =
+        isExternal
+            && !metadata.isRemote()
+            && metadata.getType() != FileStateType.SYMLINK
+            && inputPath.isSymbolicLink();
+    if (isExternal
+        && (metadata.isRemote()
+            || metadata.getType() == FileStateType.SYMLINK
+            || isLogicalExternalSymlink)) {
       // A path in an external repo, e.g. a source artifact consumed by an action or a file
       // prefetched during the materialization of an external repo. It may be (part of) a chain of
       // symlinks created by the repo rule, which has to be reproduced verbatim on disk.
@@ -611,25 +686,44 @@ public abstract class AbstractActionInputPrefetcher implements ActionInputPrefet
       ActionInput actionInput,
       FileArtifactValue metadata,
       Priority priority,
-      Reason reason) {
+      Reason reason,
+      @Nullable HostMaterialization hostMaterialization) {
     // If the path to be prefetched is a non-dangling symlink, prefetch its target path instead.
     // Note that this only applies to symlinks created by spawns (or, currently, with the internal
     // version of BwoB); symlinks created in-process through an ActionFileSystem should have already
     // been canonicalized by maybeGetSymlink.
     try {
-      if (treeRoot != null) {
-        var treeRootRelativePath = path.relativeTo(treeRoot);
-        treeRoot = maybeResolveSymlink(treeRoot);
-        path = treeRoot.getRelative(treeRootRelativePath);
-      } else {
-        path = maybeResolveSymlink(path);
+      if (hostMaterialization == null) {
+        if (treeRoot != null) {
+          var treeRootRelativePath = path.relativeTo(treeRoot);
+          treeRoot = maybeResolveSymlink(treeRoot);
+          path = treeRoot.getRelative(treeRootRelativePath);
+        } else {
+          path = maybeResolveSymlink(path);
+        }
       }
     } catch (IOException e) {
       return Completable.error(e);
     }
 
-    // Downloads are written to the actual host file system, not any overlays.
-    Path finalPath = path.forHostFileSystem();
+    // Downloads are written to the actual host file system, not any overlays. For overlay paths,
+    // repair and inspect the target under the overlay's coordination before consulting
+    // downloadCache, whose completed entries otherwise bypass the task entirely.
+    Path finalPath;
+    boolean preparedDownloadRequired = false;
+    try {
+      if (hostMaterialization != null) {
+        PreparedDownloadTarget preparedTarget =
+            hostMaterialization.prepareDownloadTarget(
+                hostPath -> shouldDownloadFile(hostPath, metadata));
+        finalPath = preparedTarget.path();
+        preparedDownloadRequired = preparedTarget.downloadRequired();
+      } else {
+        finalPath = path.forHostFileSystem();
+      }
+    } catch (IOException e) {
+      return Completable.error(e);
+    }
 
     @Nullable
     Path finalTreeRoot =
@@ -666,21 +760,34 @@ public abstract class AbstractActionInputPrefetcher implements ActionInputPrefet
                         directExecutor())
                     .doOnComplete(
                         () -> {
-                          finalizeDownload(
-                              metadata, tempPath.forHostFileSystem(), finalPath, finalTreeRoot);
+                          if (hostMaterialization != null) {
+                            hostMaterialization.finalizeDownload(
+                                () ->
+                                    finalizeDownload(
+                                        metadata,
+                                        tempPath.forHostFileSystem(),
+                                        finalPath,
+                                        finalTreeRoot));
+                          } else {
+                            finalizeDownload(
+                                metadata, tempPath.forHostFileSystem(), finalPath, finalTreeRoot);
+                          }
                           alreadyDeleted.set(true);
                         }));
 
+    boolean downloadRequired = preparedDownloadRequired;
     return downloadCache.execute(
         finalPath,
         Completable.defer(
             () -> {
-              if (shouldDownloadFile(finalPath, metadata)) {
+              if (hostMaterialization != null
+                  ? downloadRequired
+                  : shouldDownloadFile(finalPath, metadata)) {
                 return download;
               }
               return Completable.complete();
             }),
-        forceRefetch(finalPath));
+        forceRefetch(finalPath) || (hostMaterialization != null && downloadRequired));
   }
 
   private void finalizeDownload(
@@ -776,22 +883,29 @@ public abstract class AbstractActionInputPrefetcher implements ActionInputPrefet
 
   private Completable plantSymlink(Symlink symlink) {
     Path linkPath = symlink.linkPath().forHostFileSystem();
+    boolean isExternal = !symlink.linkPath().asFragment().startsWith(execRoot.asFragment());
     return downloadCache.execute(
         linkPath,
         Completable.defer(
             () -> {
-              if (!symlink.linkPath().asFragment().startsWith(execRoot.asFragment())) {
-                // If the symlink is a source file in an external repo, its parent directory may not
-                // exist yet.
+              if (isExternal) {
                 checkNotNull(linkPath.getParentDirectory()).createDirectoryAndParents();
               }
-              // Delete the link path if it already exists. This is the case for tree artifacts,
-              // whose root directory is created before the action runs.
+              try {
+                if (linkPath.readSymbolicLink().equals(symlink.targetPath())) {
+                  return Completable.complete();
+                }
+              } catch (FileNotFoundException | NotASymlinkException ignored) {
+                // Fall through. Existing non-symlinks are intentionally replaced below.
+              }
+              // Without overlay-owned containment checks, keep replacement nonrecursive. In
+              // particular, tree artifact roots are created before the action runs and an
+              // unexpected non-empty output directory must not be discarded.
               linkPath.delete();
               linkPath.createSymbolicLink(symlink.targetPath());
               return Completable.complete();
             }),
-        forceRefetch(linkPath));
+        forceRefetch(linkPath) || isExternal);
   }
 
   public ImmutableSet<Path> downloadedFiles() {

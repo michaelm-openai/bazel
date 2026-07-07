@@ -29,6 +29,7 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Lists;
+import com.google.common.util.concurrent.Striped;
 import com.google.devtools.build.lib.actions.ActionInputHelper;
 import com.google.devtools.build.lib.actions.ActionInputPrefetcher;
 import com.google.devtools.build.lib.actions.FileArtifactValue;
@@ -46,7 +47,9 @@ import com.google.devtools.build.lib.vfs.DetailedIOException;
 import com.google.devtools.build.lib.vfs.DigestHashFunction;
 import com.google.devtools.build.lib.vfs.Dirent;
 import com.google.devtools.build.lib.vfs.FileStatus;
+import com.google.devtools.build.lib.vfs.FileSymlinkLoopException;
 import com.google.devtools.build.lib.vfs.FileSystem;
+import com.google.devtools.build.lib.vfs.FileSystem.NotASymlinkException;
 import com.google.devtools.build.lib.vfs.FileSystemUtils;
 import com.google.devtools.build.lib.vfs.Path;
 import com.google.devtools.build.lib.vfs.PathFragment;
@@ -56,6 +59,7 @@ import com.google.devtools.build.skyframe.MemoizingEvaluator;
 import com.google.devtools.build.skyframe.SkyFunctionException;
 import java.io.ByteArrayInputStream;
 import java.io.File;
+import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InterruptedIOException;
@@ -72,6 +76,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.locks.Lock;
 import java.util.function.Consumer;
 import javax.annotation.Nullable;
 
@@ -82,17 +87,108 @@ import javax.annotation.Nullable;
  * <p>Each external repository can either be materialized to the native file system or kept in
  * memory in the {@link RemoteExternalFileSystem}.
  */
-public final class RemoteExternalOverlayFileSystem extends FileSystem {
+public final class RemoteExternalOverlayFileSystem extends FileSystem
+    implements AbstractActionInputPrefetcher.ExternalRepositoryOverlay {
+  /** Describes how {@link #routeAcrossFileSystems} handles symbolic links. */
+  private enum FollowMode {
+    /** Canonicalize the entire path. This is equivalent to {@link Symlinks#FOLLOW}. */
+    FOLLOW_ALL,
+    /** Canonicalize only the parent. This is equivalent to {@link Symlinks#NOFOLLOW}. */
+    FOLLOW_PARENT,
+    /** Do not canonicalize. The path's parent must already be canonical. */
+    FOLLOW_NONE,
+  }
+
+  /** The backing file system and canonical path selected by cross-file-system routing. */
+  private static final class RoutedPath {
+    private final FileSystem owner;
+    private final PathFragment canonicalPath;
+    private boolean statusKnown;
+    @Nullable private FileStatus status;
+
+    /** Creates a routed path whose final status will be loaded on demand. */
+    RoutedPath(FileSystem owner, PathFragment canonicalPath) {
+      this.owner = owner;
+      this.canonicalPath = canonicalPath;
+    }
+
+    /** Creates a routed path with an already known, possibly missing, final status. */
+    RoutedPath(FileSystem owner, PathFragment canonicalPath, @Nullable FileStatus status) {
+      this(owner, canonicalPath);
+      this.status = status;
+      this.statusKnown = true;
+    }
+
+    FileSystem owner() {
+      return owner;
+    }
+
+    PathFragment canonicalPath() {
+      return canonicalPath;
+    }
+
+    /** Returns the final status without following symlinks, loading it at most once. */
+    @Nullable
+    FileStatus status() throws IOException {
+      if (!statusKnown) {
+        status = owner.statIfFound(canonicalPath, /* followSymlinks= */ false);
+        statusKnown = true;
+      }
+      return status;
+    }
+  }
+
+  @FunctionalInterface
+  private interface FileSystemOperation<T> {
+    T run(FileSystem fileSystem, PathFragment path) throws IOException;
+  }
+
+  @FunctionalInterface
+  private interface RoutedPathOperation<T> {
+    T run(RoutedPath routedPath) throws IOException;
+  }
+
+  @FunctionalInterface
+  private interface FileSystemQuery<T> {
+    T run(FileSystem fileSystem, PathFragment path);
+  }
+
+  @FunctionalInterface
+  private interface RoutedQuery<T> {
+    T run();
+  }
+
+  /** Signals a missing path component without conflating it with other I/O errors. */
+  private static final class MissingPathException extends IOException {
+    MissingPathException(PathFragment path) {
+      super(path.getPathString() + ERR_NO_SUCH_FILE_OR_DIR);
+    }
+  }
+
+  /** A link encountered while resolving a path for host materialization. */
+  private record HostSymlink(PathFragment linkPath, PathFragment targetPath) {}
+
+  /** The result of resolving every component of a logical path through the overlay. */
+  private record HostTrace(PathFragment resolvedPath, ImmutableList<HostSymlink> symlinks) {}
+
   private final PathFragment externalDirectory;
   private final int externalDirectorySegmentCount;
   private final FileSystem nativeFs;
   private final RemoteExternalFileSystem externalFs;
+  private PathCanonicalizer pathCanonicalizer;
+  // Host repair can touch both the source and target repositories of one cross-repository link.
+  // Plans acquire all affected repository locks in a common stripe order during short synchronous
+  // sections; downloads themselves run without holding a lock.
+  private final Striped<Lock> hostMaterializationLocks = Striped.lazyWeakLock(Integer.MAX_VALUE);
   private final ConcurrentHashMap<String, Future<Void>> materializations =
       new ConcurrentHashMap<>();
   // As long as a repo name appears as a key in this map, the repo contents are available in
   // externalFs.
   private final ConcurrentHashMap<String, String> markerFileContents = new ConcurrentHashMap<>();
   private final Set<String> reposWithLostFiles = ConcurrentHashMap.newKeySet();
+  // Eager prefetching during injection writes native shadows before markerFileContents publishes
+  // the repo as externally owned. Those prefetches must keep using the ordinary host path.
+  private final Set<String> reposBeingInjected = ConcurrentHashMap.newKeySet();
 
   // Per-build information that is set in beforeCommand and cleared in afterCommand.
   @Nullable private CombinedCache cache;
@@ -110,6 +206,7 @@ public final class RemoteExternalOverlayFileSystem extends FileSystem {
     this.externalDirectorySegmentCount = externalDirectory.segmentCount();
     this.nativeFs = nativeFs;
     this.externalFs = new RemoteExternalFileSystem(nativeFs.getDigestFunction());
+    resetPathCanonicalizer();
   }
 
   public void beforeCommand(
@@ -129,6 +226,7 @@ public final class RemoteExternalOverlayFileSystem extends FileSystem {
             && this.evaluator == null
             && this.remoteCacheTtl == null
             && this.materializationExecutor == null);
+    resetPathCanonicalizer();
     this.cache = cache;
     this.inputPrefetcher = inputPrefetcher;
     this.reporter = reporter;
@@ -142,47 +240,62 @@ public final class RemoteExternalOverlayFileSystem extends FileSystem {
   }
 
   public void afterCommand() {
-    if (cache == null) {
-      // Not all commands cause beforeCommand to be called, but afterCommand is called
-      // unconditionally.
-      return;
+    try {
+      if (cache == null) {
+        // Not all commands cause beforeCommand to be called, but afterCommand is called
+        // unconditionally.
+        return;
+      }
+      this.cache = null;
+      this.inputPrefetcher = null;
+      this.reporter = null;
+      this.buildRequestId = null;
+      this.commandId = null;
+      this.remoteCacheTtl = null;
+      // Materializations happen synchronously and upon request by other repo rules, so there is no
+      // reason to await their orderly completion in afterCommand.
+      materializationExecutor.shutdownNow();
+      materializationExecutor = null;
+      // Clean up the in-memory contents of materialized repos to save memory, or those that need to
+      // be refetched to recover files that the remote cache has lost. This wouldn't be safe to do
+      // eagerly as ongoing repo rule evaluations may still refer to the in-memory content and
+      // refetching is not atomic.
+      materializations.forEach(
+          1,
+          (repoName, materializationState) ->
+              materializationState.state() == Future.State.SUCCESS
+                      || reposWithLostFiles.contains(repoName)
+                  ? repoName
+                  : null,
+          this::evictInMemoryRepo);
+      invalidateRepoDirectories(evaluator, reposWithLostFiles);
+      reposWithLostFiles.clear();
+      this.evaluator = null;
+    } finally {
+      resetPathCanonicalizer();
     }
-    this.cache = null;
-    this.inputPrefetcher = null;
-    this.reporter = null;
-    this.buildRequestId = null;
-    this.commandId = null;
-    this.remoteCacheTtl = null;
-    // Materializations happen synchronously and upon request by other repo rules, so there is no
-    // reason to await their orderly completion in afterCommand.
-    materializationExecutor.shutdownNow();
-    materializationExecutor = null;
-    // Clean up the in-memory contents of materialized repos to save memory, or those that need to
-    // be refetched to recover files that the remote cache has lost. This wouldn't be safe to do
-    // eagerly as ongoing repo rule evaluations may still refer to the in-memory content and
-    // refetching is not atomic.
-    materializations.forEach(
-        1,
-        (repoName, materializationState) ->
-            materializationState.state() == Future.State.SUCCESS
-                    || reposWithLostFiles.contains(repoName)
-                ? repoName
-                : null,
-        this::evictInMemoryRepo);
-    invalidateRepoDirectories(evaluator, reposWithLostFiles);
-    reposWithLostFiles.clear();
-    this.evaluator = null;
   }
 
   /** Removes the contents of the given repo from the in-memory overlay file system. */
   private void evictInMemoryRepo(String repoName) {
+    PathFragment repoPath = externalDirectory.getChild(repoName);
+    Lock lock = hostMaterializationLocks.get(repoPath);
+    lock.lock();
     try {
-      externalFs.deleteTree(externalDirectory.getChild(repoName));
-    } catch (IOException e) {
-      throw new IllegalStateException("In-memory file system is not expected to throw", e);
+      // Clear before and after changing repository state so a racing access can't repopulate stale
+      // canonicalization entries.
+      pathCanonicalizer.clearPrefix(repoPath);
+      try {
+        externalFs.deleteTree(repoPath);
+      } catch (IOException e) {
+        throw new IllegalStateException("In-memory file system is not expected to throw", e);
+      }
+      materializations.remove(repoName);
+      markerFileContents.remove(repoName);
+      pathCanonicalizer.clearPrefix(repoPath);
+    } finally {
+      lock.unlock();
     }
-    materializations.remove(repoName);
-    markerFileContents.remove(repoName);
   }
 
   /** Invalidates the {@link SkyFunctions#REPOSITORY_DIRECTORY} nodes of the given repos. */
@@ -203,40 +316,92 @@ public final class RemoteExternalOverlayFileSystem extends FileSystem {
    */
   public boolean injectRemoteRepo(RepositoryName repo, Tree remoteContents, String markerFile)
       throws IOException, InterruptedException {
+    String repoName = repo.getName();
     var repoDir = externalDirectory.getChild(repo.getName());
-    deleteTree(repoDir);
-    var unused = delete(externalDirectory.getChild(repo.getMarkerFileName()));
-    var childMap =
-        remoteContents.getChildrenList().stream()
-            .collect(
-                toImmutableMap(cache.digestUtil::compute, directory -> directory, (a, b) -> a));
-    var filesToPrefetch = new ArrayList<PathFragment>();
-    injectRecursively(
-        externalFs,
-        repoDir,
-        remoteContents.getRoot(),
-        childMap,
-        filesToPrefetch::add,
-        Instant.now().plus(remoteCacheTtl));
+    Lock lock = hostMaterializationLocks.get(repoDir);
+    lock.lock();
     try {
-      // TODO: This prefetches a large number of small files. Investigate whether BatchReadBlobs
-      // would be more efficient.
-      prefetch(filesToPrefetch);
-    } catch (BulkTransferException e) {
-      if (e.allCausedByCacheNotFoundException()) {
+      reposBeingInjected.add(repoName);
+      pathCanonicalizer.clearPrefix(repoDir);
+      materializations.remove(repoName);
+      markerFileContents.remove(repoName);
+      pathCanonicalizer.clearPrefix(repoDir);
+      deleteTree(repoDir);
+      var unused = delete(externalDirectory.getChild(repo.getMarkerFileName()));
+    } catch (IOException | RuntimeException e) {
+      reposBeingInjected.remove(repoName);
+      throw e;
+    } finally {
+      lock.unlock();
+    }
+
+    boolean injectionStateFinalized = false;
+    try {
+      var childMap =
+          remoteContents.getChildrenList().stream()
+              .collect(
+                  toImmutableMap(cache.digestUtil::compute, directory -> directory, (a, b) -> a));
+      var filesToPrefetch = new ArrayList<PathFragment>();
+      injectRecursively(
+          externalFs,
+          repoDir,
+          remoteContents.getRoot(),
+          childMap,
+          filesToPrefetch::add,
+          Instant.now().plus(remoteCacheTtl));
+      try {
+        // TODO: This prefetches a large number of small files. Investigate whether BatchReadBlobs
+        // would be more efficient.
+        prefetch(filesToPrefetch);
+      } catch (BulkTransferException e) {
+        if (!e.allCausedByCacheNotFoundException()) {
+          throw e;
+        }
         // The cache has lost the .bzl files, which should be treated just like a cache miss.
-        externalFs.deleteTree(repoDir);
+        lock.lock();
+        try {
+          // Clear before and after changing repository state so a racing access can't repopulate
+          // stale canonicalization entries.
+          pathCanonicalizer.clearPrefix(repoDir);
+          externalFs.deleteTree(repoDir);
+          materializations.remove(repoName);
+          markerFileContents.remove(repoName);
+          reposBeingInjected.remove(repoName);
+          pathCanonicalizer.clearPrefix(repoDir);
+          injectionStateFinalized = true;
+        } finally {
+          lock.unlock();
+        }
         return false;
       }
-      throw e;
+      // Create the repo directory on disk so that readdir reflects the overlaid state of the
+      // external directory.
+      nativeFs.createDirectoryAndParents(repoDir);
+      lock.lock();
+      try {
+        // Keep the marker file contents in memory so that it can be written out when the repo is
+        // materialized. This doubles as a presence marker for the in-memory repo contents.
+        // Clear before and after changing repository state so a racing access can't repopulate
+        // stale canonicalization entries.
+        pathCanonicalizer.clearPrefix(repoDir);
+        markerFileContents.put(repoName, markerFile);
+        reposBeingInjected.remove(repoName);
+        pathCanonicalizer.clearPrefix(repoDir);
+        injectionStateFinalized = true;
+      } finally {
+        lock.unlock();
+      }
+      return true;
+    } finally {
+      if (!injectionStateFinalized) {
+        lock.lock();
+        try {
+          reposBeingInjected.remove(repoName);
+        } finally {
+          lock.unlock();
+        }
+      }
     }
-    // Create the repo directory on disk so that readdir reflects the overlaid state of the external
-    // directory.
-    nativeFs.createDirectoryAndParents(repoDir);
-    // Keep the marker file contents in memory so that it can be written out when the repo is
-    // materialized. This doubles as a presence marker for the in-memory repo contents.
-    markerFileContents.put(repo.getName(), markerFile);
-    return true;
   }
 
   private static void injectRecursively(
@@ -334,8 +499,18 @@ public final class RemoteExternalOverlayFileSystem extends FileSystem {
     var markerFile = nativeFs.getPath(externalDirectory.getChild(repo.getMarkerFileName()));
     var markerFileSibling =
         nativeFs.getPath(externalDirectory.getChild(repo.getMarkerFileName() + ".tmp"));
-    FileSystemUtils.writeContentAsLatin1(
-        markerFileSibling, markerFileContents.remove(repo.getName()));
+    String markerContents;
+    Lock lock = hostMaterializationLocks.get(repoPath);
+    lock.lock();
+    try {
+      pathCanonicalizer.clearPrefix(repoPath);
+      markerContents = markerFileContents.remove(repo.getName());
+      // Clear again in case an access raced with the ownership switch above.
+      pathCanonicalizer.clearPrefix(repoPath);
+    } finally {
+      lock.unlock();
+    }
+    FileSystemUtils.writeContentAsLatin1(markerFileSibling, markerContents);
     markerFileSibling.renameTo(markerFile);
   }
 
@@ -357,6 +532,7 @@ public final class RemoteExternalOverlayFileSystem extends FileSystem {
    */
   public void notifyNoCacheAvailable(MemoizingEvaluator evaluator) {
     checkState(materializationExecutor == null, "must not be called when active");
+    resetPathCanonicalizer();
     var reposToDiscard = ImmutableSet.copyOf(markerFileContents.keySet());
     reposToDiscard.forEach(this::evictInMemoryRepo);
     invalidateRepoDirectories(evaluator, reposToDiscard);
@@ -401,27 +577,302 @@ public final class RemoteExternalOverlayFileSystem extends FileSystem {
     return nativeFs.getHostFileSystem();
   }
 
-  // Always mirror tree deletions to the underlying native file system to support bazel clean and
-  // repository refetching.
+  @Nullable
+  @Override
+  public AbstractActionInputPrefetcher.HostMaterialization getHostMaterialization(Path path)
+      throws IOException {
+    if (path.getFileSystem() != this || !path.asFragment().startsWith(externalDirectory)) {
+      return null;
+    }
+    PathFragment logicalPath = path.asFragment();
+    if (isBeingInjected(logicalPath)) {
+      return null;
+    }
+    return new OverlayHostMaterialization(logicalPath, traceHostPath(logicalPath));
+  }
+
+  private boolean isBeingInjected(PathFragment path) {
+    return !path.equals(externalDirectory)
+        && reposBeingInjected.contains(path.getSegment(externalDirectorySegmentCount));
+  }
+
+  /** Traces a path without mutating ownership state or acquiring repository locks. */
+  private HostTrace traceHostPath(PathFragment logicalPath) throws IOException {
+    var symlinks = ImmutableList.<HostSymlink>builder();
+    PathFragment resolvedPath = logicalPath;
+    int remainingLinks = 32;
+    int segmentIndex = 0;
+    while (segmentIndex < resolvedPath.segmentCount()) {
+      PathFragment candidate = resolvedPath.subFragment(0, segmentIndex + 1);
+      FileSystem owner = fsForPath(candidate, /* cleanUpLostRepo= */ false);
+      FileStatus status = owner.statIfFound(candidate, /* followSymlinks= */ false);
+      if (status == null) {
+        break;
+      }
+      if (!status.isSymbolicLink()) {
+        segmentIndex++;
+        continue;
+      }
+      if (remainingLinks-- == 0) {
+        throw new FileSymlinkLoopException(logicalPath.getPathString() + ERR_TOO_MANY_SYMLINKS);
+      }
+      PathFragment target = owner.readSymbolicLink(candidate);
+      symlinks.add(new HostSymlink(candidate, target));
+      if (!target.isAbsolute()) {
+        target = candidate.getParentDirectory().getRelative(target);
+      }
+      PathFragment suffix = resolvedPath.subFragment(segmentIndex + 1, resolvedPath.segmentCount());
+      resolvedPath = target.getRelative(suffix);
+      segmentIndex = 0;
+    }
+    return new HostTrace(resolvedPath, symlinks.build());
+  }
+
+  private PathFragment repositoryRoot(PathFragment path) {
+    return path.startsWith(externalDirectory) && !path.equals(externalDirectory)
+        ? externalDirectory.getChild(path.getSegment(externalDirectorySegmentCount))
+        : externalDirectory;
+  }
+
+  /** Host materialization work computed from one component-by-component overlay traversal. */
+  private final class OverlayHostMaterialization
+      implements AbstractActionInputPrefetcher.HostMaterialization {
+    private final PathFragment resolvedPath;
+    private final PathFragment logicalPath;
+    private final HostTrace trace;
+    private final ImmutableList<HostSymlink> symlinks;
+    private final ImmutableSet<PathFragment> repositoryRoots;
+    private final ImmutableList<Lock> locks;
+
+    OverlayHostMaterialization(PathFragment logicalPath, HostTrace trace) {
+      this.logicalPath = logicalPath;
+      this.trace = trace;
+      this.resolvedPath = trace.resolvedPath();
+      this.symlinks = trace.symlinks();
+      var repositoryRoots = ImmutableSet.<PathFragment>builder();
+      repositoryRoots.add(repositoryRoot(logicalPath));
+      if (resolvedPath.startsWith(externalDirectory)) {
+        repositoryRoots.add(repositoryRoot(resolvedPath));
+      }
+      for (HostSymlink symlink : symlinks) {
+        if (symlink.linkPath().startsWith(externalDirectory)) {
+          repositoryRoots.add(repositoryRoot(symlink.linkPath()));
+        }
+      }
+      // bulkGet orders the actual stripes, not the keys, so overlapping multi-repository plans
+      // acquire their locks in a common order.
+      this.repositoryRoots = repositoryRoots.build();
+      this.locks = ImmutableList.copyOf(hostMaterializationLocks.bulkGet(this.repositoryRoots));
+    }
+
+    @Override
+    public Path getResolvedPath() {
+      return getPath(resolvedPath);
+    }
+
+    @Override
+    public AbstractActionInputPrefetcher.PreparedDownloadTarget prepareDownloadTarget(
+        AbstractActionInputPrefetcher.HostPathChecker checker) throws IOException {
+      lockAll();
+      try {
+        validateTraceLocked();
+        Path hostTarget = prepareDownloadTargetLocked(resolvedPath);
+        return new AbstractActionInputPrefetcher.PreparedDownloadTarget(
+            hostTarget, checker.run(hostTarget));
+      } finally {
+        unlockAll();
+      }
+    }
+
+    @Override
+    public void finalizeDownload(AbstractActionInputPrefetcher.HostFinalizer finalizer)
+        throws IOException {
+      lockAll();
+      try {
+        validateTraceLocked();
+        prepareDownloadTargetLocked(resolvedPath);
+        finalizer.run();
+      } finally {
+        unlockAll();
+      }
+    }
+
+    @Override
+    public void materializeSymlinks() throws IOException {
+      lockAll();
+      try {
+        validateTraceLocked();
+        // Plant targets before links. This is required for platforms where the symlink type is
+        // inferred from an existing target.
+        for (HostSymlink symlink : symlinks.reverse()) {
+          materializeSymlinkLocked(symlink);
+        }
+      } finally {
+        unlockAll();
+      }
+    }
+
+    private void lockAll() {
+      for (Lock lock : locks) {
+        lock.lock();
+      }
+    }
+
+    private void unlockAll() {
+      for (int i = locks.size() - 1; i >= 0; i--) {
+        locks.get(i).unlock();
+      }
+    }
+
+    private void validateTraceLocked() throws IOException {
+      if (repositoryRoots.stream().anyMatch(RemoteExternalOverlayFileSystem.this::isBeingInjected)
+          || !traceHostPath(logicalPath).equals(trace)) {
+        throw new IOException(String.format("External repository path changed: %s", logicalPath));
+      }
+    }
+  }
+
+  /**
+   * Verifies a host path from the trusted external root downward without following host links.
+   *
+   * <p>The final component is a regular-file download target. A missing target is left for the
+   * caller's guarded content check to request from the remote cache.
+   */
+  private Path prepareDownloadTargetLocked(PathFragment logicalTarget) throws IOException {
+    if (!logicalTarget.startsWith(externalDirectory) || logicalTarget.equals(externalDirectory)) {
+      return nativeFs.getPath(logicalTarget).forHostFileSystem();
+    }
+    FileSystem currentOwner = fsForPath(logicalTarget);
+    if (currentOwner == externalFs) {
+      FileStatus logicalStatus = externalFs.statIfFound(logicalTarget, /* followSymlinks= */ false);
+      if (logicalStatus == null || !logicalStatus.isFile()) {
+        throw new IOException(
+            String.format("Expected external file download target: %s", logicalTarget));
+      }
+    }
+    prepareHostParentLocked(logicalTarget);
+    Path hostTarget = nativeFs.getPath(logicalTarget).forHostFileSystem();
+    FileStatus hostStatus = hostTarget.statIfFound(Symlinks.NOFOLLOW);
+    if (hostStatus == null) {
+      return hostTarget;
+    }
+    if (hostStatus.isFile()) {
+      return hostTarget;
+    }
+    if (currentOwner != externalFs) {
+      throw new IOException(String.format("Expected native file download target: %s", hostTarget));
+    }
+    if (hostStatus.isDirectory()) {
+      hostTarget.deleteTree();
+    } else {
+      hostTarget.delete();
+    }
+    return hostTarget;
+  }
+
+  /** Ensures that every parent below the trusted external root is an expected real directory. */
+  private void prepareHostParentLocked(PathFragment logicalPath) throws IOException {
+    PathFragment logicalParent = logicalPath.getParentDirectory();
+    if (logicalParent == null || !logicalParent.startsWith(externalDirectory)) {
+      return;
+    }
+    Path hostExternalDirectory = nativeFs.getPath(externalDirectory).forHostFileSystem();
+    FileStatus rootStatus = hostExternalDirectory.statIfFound(Symlinks.NOFOLLOW);
+    if (rootStatus == null || !rootStatus.isDirectory()) {
+      throw new IOException(
+          String.format(
+              "External repository directory is not a directory: %s", hostExternalDirectory));
+    }
+
+    PathFragment logicalDirectory = externalDirectory;
+    Path hostDirectory = hostExternalDirectory;
+    for (String segment : logicalParent.relativeTo(externalDirectory).segments()) {
+      logicalDirectory = logicalDirectory.getChild(segment);
+      hostDirectory = hostDirectory.getChild(segment);
+      FileStatus logicalStatus = statIfFoundInternal(logicalDirectory, /* followSymlinks= */ false);
+      if (logicalStatus == null || !logicalStatus.isDirectory()) {
+        throw new IOException(
+            String.format("Expected external repository directory: %s", logicalDirectory));
+      }
+      FileStatus hostStatus = hostDirectory.statIfFound(Symlinks.NOFOLLOW);
+      if (hostStatus != null && hostStatus.isDirectory()) {
+        continue;
+      }
+      if (hostStatus != null) {
+        // Every ancestor has already been checked with NOFOLLOW, so unlinking this component
+        // cannot traverse a stale link out of the repository tree.
+        hostDirectory.delete();
+      }
+      hostDirectory.createDirectory();
+    }
+  }
+
+  private void materializeSymlinkLocked(HostSymlink symlink) throws IOException {
+    FileSystem currentOwner = fsForPath(symlink.linkPath());
+    if (currentOwner != externalFs) {
+      // The repository was materialized after this plan was created. Its native state is already
+      // the host representation, so the old external state no longer has destructive authority.
+      return;
+    }
+    FileStatus logicalStatus =
+        currentOwner.statIfFound(symlink.linkPath(), /* followSymlinks= */ false);
+    if (logicalStatus == null
+        || !logicalStatus.isSymbolicLink()
+        || !currentOwner.readSymbolicLink(symlink.linkPath()).equals(symlink.targetPath())) {
+      throw new IOException(
+          String.format("External repository symlink changed: %s", symlink.linkPath()));
+    }
+    prepareHostParentLocked(symlink.linkPath());
+    Path hostLink = nativeFs.getPath(symlink.linkPath()).forHostFileSystem();
+    try {
+      if (hostLink.readSymbolicLink().equals(symlink.targetPath())) {
+        return;
+      }
+    } catch (FileNotFoundException | NotASymlinkException ignored) {
+      // Fall through and replace the stale host node.
+    }
+    FileStatus hostStatus = hostLink.statIfFound(Symlinks.NOFOLLOW);
+    if (hostStatus != null && hostStatus.isDirectory()) {
+      // The verified parent walk contains recursive removal to this final component.
+      hostLink.deleteTree();
+    } else if (hostStatus != null) {
+      hostLink.delete();
+    }
+    hostLink.createSymbolicLink(symlink.targetPath());
+  }
+
+  // Always mirror tree deletions to both backing file systems. Native files may shadow entries in
+  // an injected repository after selective prefetching and must not survive deletion of the
+  // corresponding in-memory subtree.
 
   @Override
   public void deleteTree(PathFragment path) throws IOException {
-    nativeFs.deleteTree(path);
-    externalFs.deleteTree(path);
+    RoutedPath routedPath = route(path, FollowMode.FOLLOW_PARENT);
+    clearCanonicalization(path, routedPath);
+    nativeFs.deleteTree(routedPath.canonicalPath());
+    externalFs.deleteTree(routedPath.canonicalPath());
   }
 
   @Override
   public void deleteTreesBelow(PathFragment dir) throws IOException {
-    nativeFs.deleteTreesBelow(dir);
-    externalFs.deleteTreesBelow(dir);
+    RoutedPath routedPath = route(dir, FollowMode.FOLLOW_PARENT);
+    clearCanonicalization(dir, routedPath);
+    nativeFs.deleteTreesBelow(routedPath.canonicalPath());
+    externalFs.deleteTreesBelow(routedPath.canonicalPath());
   }
 
-  // All other methods delegate to the file system given by this method. It is important to override
-  // each non-final FileSystem method to benefit from optimizations implemented in the respective
-  // underlying file systems.
+  // Selects the backing file system for a path based on current repository ownership. During
+  // cross-file-system routing, this is called for every canonical prefix so that a symlink can
+  // change backings in either direction. Overrides still invoke the selected backing operation
+  // directly so that backing-specific fast paths remain available.
   private FileSystem fsForPath(PathFragment path) {
+    return fsForPath(path, /* cleanUpLostRepo= */ true);
+  }
+
+  private FileSystem fsForPath(PathFragment path, boolean cleanUpLostRepo) {
     if (path.startsWith(externalDirectory) && !path.equals(externalDirectory)) {
       String repoName = path.getSegment(externalDirectorySegmentCount);
+      PathFragment repoPath = externalDirectory.getChild(repoName);
       var hasBeenInjected = markerFileContents.containsKey(repoName);
       var hasBeenMaterialized =
           materializations.getOrDefault(repoName, immediateCancelledFuture()).state()
@@ -429,11 +880,30 @@ public final class RemoteExternalOverlayFileSystem extends FileSystem {
       if (hasBeenInjected && !hasBeenMaterialized) {
         // The repo may have been deleted due to refetching. Clean up in-memory state if that is the
         // case.
-        if (externalFs.getPath(externalDirectory.getChild(repoName)).exists()) {
+        if (externalFs.getPath(repoPath).exists()) {
           return externalFs;
         }
-        materializations.remove(repoName);
-        markerFileContents.remove(repoName);
+        if (!cleanUpLostRepo) {
+          return nativeFs;
+        }
+        Lock lock = hostMaterializationLocks.get(repoPath);
+        lock.lock();
+        try {
+          hasBeenInjected = markerFileContents.containsKey(repoName);
+          hasBeenMaterialized =
+              materializations.getOrDefault(repoName, immediateCancelledFuture()).state()
+                  == Future.State.SUCCESS;
+          if (hasBeenInjected && !hasBeenMaterialized) {
+            if (externalFs.getPath(repoPath).exists()) {
+              return externalFs;
+            }
+            materializations.remove(repoName);
+            markerFileContents.remove(repoName);
+            pathCanonicalizer.clearPrefix(repoPath);
+          }
+        } finally {
+          lock.unlock();
+        }
       }
       // Fall back to the native file system if the repo has been materialized, deleted, or never
       // injected.
@@ -441,35 +911,212 @@ public final class RemoteExternalOverlayFileSystem extends FileSystem {
     return nativeFs;
   }
 
+  private void resetPathCanonicalizer() {
+    pathCanonicalizer = PathCanonicalizer.createSelective(this::resolveOneLinkForCanonicalParent);
+  }
+
+  private PathCanonicalizer.Resolution resolveOneLinkForCanonicalParent(PathFragment path)
+      throws IOException {
+    FileSystem owner = fsForPath(path);
+    FileStatus status = owner.statIfFound(path, /* followSymlinks= */ false);
+    if (status == null) {
+      throw new MissingPathException(path);
+    }
+    PathFragment targetPath = status.isSymbolicLink() ? owner.readSymbolicLink(path) : null;
+    // The external directory and its ancestors are fixed for the duration of a command. Cache
+    // them even though they reside in nativeFs so every repository access does not repeat the
+    // native prefix walk. Native paths below the external directory remain mutable.
+    boolean cacheable = owner == externalFs || externalDirectory.startsWith(path);
+    return new PathCanonicalizer.Resolution(targetPath, cacheable);
+  }
+
+  /**
+   * Routes a path through both backing file systems, reusing cached canonical prefixes.
+   *
+   * <p>The final status is loaded only if a caller requests it. Missing components leave the
+   * canonical existing prefix and unresolved suffix intact so that creation operations can still
+   * use the routed path. Other I/O errors are propagated.
+   */
+  private RoutedPath routeAcrossFileSystems(PathFragment path, FollowMode followMode)
+      throws IOException {
+    return switch (followMode) {
+      case FOLLOW_NONE -> {
+        FileSystem owner = fsForPath(path);
+        yield new RoutedPath(owner, path);
+      }
+      case FOLLOW_PARENT -> {
+        PathFragment parent = path.getParentDirectory();
+        if (parent == null) {
+          yield routeAcrossFileSystems(path, FollowMode.FOLLOW_NONE);
+        }
+        RoutedPath routedParent = routeAcrossFileSystems(parent, FollowMode.FOLLOW_ALL);
+        PathFragment canonicalPath = routedParent.canonicalPath().getChild(path.getBaseName());
+        FileSystem owner = fsForPath(canonicalPath);
+        FileStatus parentStatus = routedParent.status();
+        yield parentStatus != null && parentStatus.isDirectory()
+            ? new RoutedPath(owner, canonicalPath)
+            : new RoutedPath(owner, canonicalPath, /* status= */ null);
+      }
+      case FOLLOW_ALL -> routeFollowingSymlinks(path);
+    };
+  }
+
+  private RoutedPath routeFollowingSymlinks(PathFragment path) throws IOException {
+    try {
+      PathFragment canonicalPath = pathCanonicalizer.resolveSymbolicLinks(path);
+      FileSystem owner = fsForPath(canonicalPath);
+      return new RoutedPath(owner, canonicalPath);
+    } catch (MissingPathException e) {
+      PathFragment parent = path.getParentDirectory();
+      if (parent == null) {
+        return routeAcrossFileSystems(path, FollowMode.FOLLOW_NONE);
+      }
+      RoutedPath routedParent = routeAcrossFileSystems(parent, FollowMode.FOLLOW_ALL);
+      PathFragment canonicalPath = routedParent.canonicalPath().getChild(path.getBaseName());
+      FileSystem owner = fsForPath(canonicalPath);
+      if (routedParent.status() == null || !routedParent.status().isDirectory()) {
+        return new RoutedPath(owner, canonicalPath, /* status= */ null);
+      }
+      FileStatus status = owner.statIfFound(canonicalPath, /* followSymlinks= */ false);
+      if (status == null || !status.isSymbolicLink()) {
+        return new RoutedPath(owner, canonicalPath, status);
+      }
+      PathFragment target = owner.readSymbolicLink(canonicalPath);
+      if (!target.isAbsolute()) {
+        target = canonicalPath.getParentDirectory().getRelative(target);
+      }
+      return routeAcrossFileSystems(target, FollowMode.FOLLOW_ALL);
+    }
+  }
+
+  private boolean requiresCrossFileSystemRouting(PathFragment path) {
+    return path.startsWith(externalDirectory);
+  }
+
+  private RoutedPath route(PathFragment path, FollowMode followMode) throws IOException {
+    return requiresCrossFileSystemRouting(path)
+        ? routeAcrossFileSystems(path, followMode)
+        : new RoutedPath(nativeFs, path);
+  }
+
+  private static FollowMode followMode(boolean followSymlinks) {
+    return followSymlinks ? FollowMode.FOLLOW_ALL : FollowMode.FOLLOW_PARENT;
+  }
+
+  private static FileStatus statOrThrow(RoutedPath routedPath) throws IOException {
+    FileStatus status = routedPath.status();
+    return status != null
+        ? status
+        : routedPath.owner().stat(routedPath.canonicalPath(), /* followSymlinks= */ false);
+  }
+
+  private void clearCanonicalization(PathFragment path, RoutedPath routedPath) {
+    pathCanonicalizer.clearPrefix(path);
+    if (!routedPath.canonicalPath().equals(path)) {
+      pathCanonicalizer.clearPrefix(routedPath.canonicalPath());
+    }
+  }
+
+  private <T> T runRoutedOperation(
+      PathFragment path,
+      FollowMode followMode,
+      FileSystemOperation<T> directOperation,
+      RoutedPathOperation<T> routedOperation)
+      throws IOException {
+    if (!requiresCrossFileSystemRouting(path)) {
+      return directOperation.run(nativeFs, path);
+    }
+    return routedOperation.run(routeAcrossFileSystems(path, followMode));
+  }
+
+  private <T> T runRoutedOperation(
+      PathFragment path, FollowMode followMode, FileSystemOperation<T> operation)
+      throws IOException {
+    return runRoutedOperation(
+        path,
+        followMode,
+        operation,
+        routedPath -> operation.run(routedPath.owner(), routedPath.canonicalPath()));
+  }
+
+  private <T> T runScopedQuery(
+      PathFragment path, FileSystemQuery<T> directQuery, RoutedQuery<T> routedQuery) {
+    return requiresCrossFileSystemRouting(path)
+        ? routedQuery.run()
+        : directQuery.run(nativeFs, path);
+  }
+
+  private boolean queryRoutedCapability(
+      PathFragment path, FollowMode followMode, FileSystemQuery<Boolean> query) {
+    if (!requiresCrossFileSystemRouting(path)) {
+      return query.run(nativeFs, path);
+    }
+    try {
+      RoutedPath routedPath = routeAcrossFileSystems(path, followMode);
+      return query.run(routedPath.owner(), routedPath.canonicalPath());
+    } catch (IOException e) {
+      return false;
+    }
+  }
+
+  @Nullable
+  private FileStatus statNullableAcrossFileSystems(PathFragment path, boolean followSymlinks) {
+    try {
+      return routeAcrossFileSystems(path, followMode(followSymlinks)).status();
+    } catch (IOException e) {
+      return null;
+    }
+  }
+
+  @Nullable
+  private FileStatus statIfFoundInternal(PathFragment path, boolean followSymlinks)
+      throws IOException {
+    return runRoutedOperation(
+        path,
+        followMode(followSymlinks),
+        (fileSystem, directPath) -> fileSystem.statIfFound(directPath, followSymlinks),
+        RoutedPath::status);
+  }
+
   @Override
   public boolean delete(PathFragment path) throws IOException {
-    return fsForPath(path).delete(path);
+    RoutedPath routedPath = route(path, FollowMode.FOLLOW_PARENT);
+    clearCanonicalization(path, routedPath);
+    return routedPath.owner().delete(routedPath.canonicalPath());
   }
 
   @Override
   public byte[] getDigest(PathFragment path) throws IOException {
-    return fsForPath(path).getDigest(path);
+    return runRoutedOperation(
+        path,
+        FollowMode.FOLLOW_ALL,
+        (fileSystem, canonicalPath) -> fileSystem.getDigest(canonicalPath));
   }
 
   @Nullable
   @Override
   public byte[] getFastDigest(PathFragment path) throws IOException {
-    return fsForPath(path).getFastDigest(path);
+    return runRoutedOperation(
+        path,
+        FollowMode.FOLLOW_ALL,
+        (fileSystem, canonicalPath) -> fileSystem.getFastDigest(canonicalPath));
   }
 
   @Override
   public boolean supportsModifications(PathFragment path) {
-    return fsForPath(path).supportsModifications(path);
+    return queryRoutedCapability(path, FollowMode.FOLLOW_ALL, FileSystem::supportsModifications);
   }
 
   @Override
   public boolean supportsSymbolicLinksNatively(PathFragment path) {
-    return fsForPath(path).supportsSymbolicLinksNatively(path);
+    return queryRoutedCapability(
+        path, FollowMode.FOLLOW_PARENT, FileSystem::supportsSymbolicLinksNatively);
   }
 
   @Override
   public boolean supportsHardLinksNatively(PathFragment path) {
-    return fsForPath(path).supportsHardLinksNatively(path);
+    return queryRoutedCapability(
+        path, FollowMode.FOLLOW_PARENT, FileSystem::supportsHardLinksNatively);
   }
 
   @Override
@@ -479,116 +1126,178 @@ public final class RemoteExternalOverlayFileSystem extends FileSystem {
 
   @Override
   public boolean createDirectory(PathFragment path) throws IOException {
-    return fsForPath(path).createDirectory(path);
+    RoutedPath routedPath = route(path, FollowMode.FOLLOW_PARENT);
+    clearCanonicalization(path, routedPath);
+    return routedPath.owner().createDirectory(routedPath.canonicalPath());
   }
 
   @Override
   public void createDirectoryAndParents(PathFragment path) throws IOException {
-    fsForPath(path).createDirectoryAndParents(path);
+    RoutedPath routedPath = route(path, FollowMode.FOLLOW_ALL);
+    clearCanonicalization(path, routedPath);
+    routedPath.owner().createDirectoryAndParents(routedPath.canonicalPath());
   }
 
   @Override
   public long getFileSize(PathFragment path, boolean followSymlinks) throws IOException {
-    return fsForPath(path).getFileSize(path, followSymlinks);
+    return runRoutedOperation(
+        path,
+        followMode(followSymlinks),
+        (fileSystem, directPath) -> fileSystem.getFileSize(directPath, followSymlinks),
+        routedPath -> statOrThrow(routedPath).getSize());
   }
 
   @Override
   public long getLastModifiedTime(PathFragment path, boolean followSymlinks) throws IOException {
-    return fsForPath(path).getLastModifiedTime(path, followSymlinks);
+    return runRoutedOperation(
+        path,
+        followMode(followSymlinks),
+        (fileSystem, directPath) -> fileSystem.getLastModifiedTime(directPath, followSymlinks),
+        routedPath -> statOrThrow(routedPath).getLastModifiedTime());
   }
 
   @Override
   public void setLastModifiedTime(PathFragment path, long newTime) throws IOException {
-    fsForPath(path).setLastModifiedTime(path, newTime);
+    RoutedPath routedPath = route(path, FollowMode.FOLLOW_ALL);
+    routedPath.owner().setLastModifiedTime(routedPath.canonicalPath(), newTime);
   }
 
   @Override
   public FileStatus stat(PathFragment path, boolean followSymlinks) throws IOException {
-    return fsForPath(path).stat(path, followSymlinks);
+    return runRoutedOperation(
+        path,
+        followMode(followSymlinks),
+        (fileSystem, directPath) -> fileSystem.stat(directPath, followSymlinks),
+        RemoteExternalOverlayFileSystem::statOrThrow);
   }
 
   @Override
   public void createSymbolicLink(
       PathFragment linkPath, PathFragment targetFragment, SymlinkTargetType hint)
       throws IOException {
-    fsForPath(linkPath).createSymbolicLink(linkPath, targetFragment, hint);
+    RoutedPath routedPath = route(linkPath, FollowMode.FOLLOW_PARENT);
+    clearCanonicalization(linkPath, routedPath);
+    routedPath.owner().createSymbolicLink(routedPath.canonicalPath(), targetFragment, hint);
   }
 
   @Override
   public PathFragment readSymbolicLink(PathFragment path) throws IOException {
-    return fsForPath(path).readSymbolicLink(path);
+    return runRoutedOperation(
+        path,
+        FollowMode.FOLLOW_PARENT,
+        (fileSystem, canonicalPath) -> fileSystem.readSymbolicLink(canonicalPath));
   }
 
   @Override
   public boolean exists(PathFragment path, boolean followSymlinks) {
-    return fsForPath(path).exists(path, followSymlinks);
+    return runScopedQuery(
+        path,
+        (fileSystem, directPath) -> fileSystem.exists(directPath, followSymlinks),
+        () -> statNullableAcrossFileSystems(path, followSymlinks) != null);
   }
 
   @Override
   public boolean exists(PathFragment path) {
-    return fsForPath(path).exists(path);
+    return exists(path, /* followSymlinks= */ true);
   }
 
   @Override
   public Collection<String> getDirectoryEntries(PathFragment path) throws IOException {
-    return fsForPath(path).getDirectoryEntries(path);
+    return runRoutedOperation(
+        path,
+        FollowMode.FOLLOW_ALL,
+        (fileSystem, canonicalPath) -> fileSystem.getDirectoryEntries(canonicalPath));
   }
 
   @Override
   public boolean isReadable(PathFragment path) throws IOException {
-    return fsForPath(path).isReadable(path);
+    return runRoutedOperation(
+        path,
+        FollowMode.FOLLOW_ALL,
+        (fileSystem, canonicalPath) -> fileSystem.isReadable(canonicalPath));
   }
 
   @Override
   public void setReadable(PathFragment path, boolean readable) throws IOException {
-    fsForPath(path).setReadable(path, readable);
+    RoutedPath routedPath = route(path, FollowMode.FOLLOW_ALL);
+    routedPath.owner().setReadable(routedPath.canonicalPath(), readable);
   }
 
   @Override
   public boolean isWritable(PathFragment path) throws IOException {
-    return fsForPath(path).isWritable(path);
+    return runRoutedOperation(
+        path,
+        FollowMode.FOLLOW_ALL,
+        (fileSystem, canonicalPath) -> fileSystem.isWritable(canonicalPath));
   }
 
   @Override
   public void setWritable(PathFragment path, boolean writable) throws IOException {
-    fsForPath(path).setWritable(path, writable);
+    RoutedPath routedPath = route(path, FollowMode.FOLLOW_ALL);
+    routedPath.owner().setWritable(routedPath.canonicalPath(), writable);
   }
 
   @Override
   public boolean isExecutable(PathFragment path) throws IOException {
-    return fsForPath(path).isExecutable(path);
+    return runRoutedOperation(
+        path,
+        FollowMode.FOLLOW_ALL,
+        (fileSystem, canonicalPath) -> fileSystem.isExecutable(canonicalPath));
   }
 
   @Override
   public void setExecutable(PathFragment path, boolean executable) throws IOException {
-    fsForPath(path).setExecutable(path, executable);
+    RoutedPath routedPath = route(path, FollowMode.FOLLOW_ALL);
+    routedPath.owner().setExecutable(routedPath.canonicalPath(), executable);
   }
 
   @Override
   public InputStream getInputStream(PathFragment path) throws IOException {
-    return fsForPath(path).getInputStream(path);
+    return runRoutedOperation(
+        path,
+        FollowMode.FOLLOW_ALL,
+        (fileSystem, canonicalPath) -> fileSystem.getInputStream(canonicalPath));
   }
 
   @Override
   public SeekableByteChannel createReadWriteByteChannel(PathFragment path) throws IOException {
-    return fsForPath(path).createReadWriteByteChannel(path);
+    RoutedPath routedPath = route(path, FollowMode.FOLLOW_ALL);
+    return routedPath.owner().createReadWriteByteChannel(routedPath.canonicalPath());
   }
 
   @Override
   public OutputStream getOutputStream(PathFragment path, boolean append, boolean internal)
       throws IOException {
-    return fsForPath(path).getOutputStream(path, append, internal);
+    RoutedPath routedPath = route(path, FollowMode.FOLLOW_ALL);
+    return routedPath.owner().getOutputStream(routedPath.canonicalPath(), append, internal);
   }
 
   @Override
   public void renameTo(PathFragment sourcePath, PathFragment targetPath) throws IOException {
-    fsForPath(sourcePath).renameTo(sourcePath, targetPath);
+    RoutedPath routedSource = route(sourcePath, FollowMode.FOLLOW_PARENT);
+    RoutedPath routedTarget = route(targetPath, FollowMode.FOLLOW_PARENT);
+    clearCanonicalization(sourcePath, routedSource);
+    clearCanonicalization(targetPath, routedTarget);
+    if (routedSource.owner() != routedTarget.owner()) {
+      throw new IOException(
+          "Cannot rename across file systems: " + sourcePath + " to " + targetPath);
+    }
+    routedSource.owner().renameTo(routedSource.canonicalPath(), routedTarget.canonicalPath());
   }
 
   @Override
   public void createFSDependentHardLink(PathFragment linkPath, PathFragment originalPath)
       throws IOException {
-    fsForPath(originalPath).createFSDependentHardLink(linkPath, originalPath);
+    RoutedPath routedLink = route(linkPath, FollowMode.FOLLOW_PARENT);
+    RoutedPath routedOriginal = route(originalPath, FollowMode.FOLLOW_PARENT);
+    clearCanonicalization(linkPath, routedLink);
+    if (routedLink.owner() != routedOriginal.owner()) {
+      throw new IOException(
+          "Cannot create hard link across file systems: " + linkPath + " to " + originalPath);
+    }
+    routedOriginal
+        .owner()
+        .createFSDependentHardLink(routedLink.canonicalPath(), routedOriginal.canonicalPath());
   }
 
   @Override
@@ -603,77 +1312,180 @@ public final class RemoteExternalOverlayFileSystem extends FileSystem {
 
   @Override
   public String getFileSystemType(PathFragment path) {
-    return fsForPath(path).getFileSystemType(path);
+    return runScopedQuery(
+        path,
+        FileSystem::getFileSystemType,
+        () -> {
+          try {
+            RoutedPath routedPath = routeAcrossFileSystems(path, FollowMode.FOLLOW_ALL);
+            return routedPath.owner().getFileSystemType(routedPath.canonicalPath());
+          } catch (IOException e) {
+            return "unknown";
+          }
+        });
   }
 
   @Override
   public byte[] getxattr(PathFragment path, String name, boolean followSymlinks)
       throws IOException {
-    return fsForPath(path).getxattr(path, name, followSymlinks);
+    return runRoutedOperation(
+        path,
+        followMode(followSymlinks),
+        (fileSystem, directPath) -> fileSystem.getxattr(directPath, name, followSymlinks),
+        routedPath ->
+            routedPath
+                .owner()
+                .getxattr(routedPath.canonicalPath(), name, /* followSymlinks= */ false));
   }
 
   @Nullable
   @Override
   public PathFragment resolveOneLink(PathFragment path) throws IOException {
-    return fsForPath(path).resolveOneLink(path);
+    return runRoutedOperation(
+        path,
+        FollowMode.FOLLOW_PARENT,
+        FileSystem::resolveOneLink,
+        routedPath -> {
+          FileStatus status = statOrThrow(routedPath);
+          return status.isSymbolicLink()
+              ? routedPath.owner().readSymbolicLink(routedPath.canonicalPath())
+              : null;
+        });
   }
 
   @Override
   public Path resolveSymbolicLinks(PathFragment path) throws IOException {
-    // Ensure that the return value doesn't leave the overlay file system.
-    return getPath(fsForPath(path).resolveSymbolicLinks(path).asFragment());
+    return runRoutedOperation(
+        path,
+        FollowMode.FOLLOW_ALL,
+        (fileSystem, directPath) ->
+            getPath(fileSystem.resolveSymbolicLinks(directPath).asFragment()),
+        routedPath -> {
+          statOrThrow(routedPath);
+          return getPath(routedPath.canonicalPath());
+        });
   }
 
   @Nullable
   @Override
   public FileStatus statNullable(PathFragment path, boolean followSymlinks) {
-    return fsForPath(path).statNullable(path, followSymlinks);
+    return runScopedQuery(
+        path,
+        (fileSystem, directPath) -> fileSystem.statNullable(directPath, followSymlinks),
+        () -> statNullableAcrossFileSystems(path, followSymlinks));
   }
 
   @Nullable
   @Override
   public FileStatus statIfFound(PathFragment path, boolean followSymlinks) throws IOException {
-    return fsForPath(path).statIfFound(path, followSymlinks);
+    return statIfFoundInternal(path, followSymlinks);
   }
 
   @Override
   public boolean isFile(PathFragment path, boolean followSymlinks) {
-    return fsForPath(path).isFile(path, followSymlinks);
+    return runScopedQuery(
+        path,
+        (fileSystem, directPath) -> fileSystem.isFile(directPath, followSymlinks),
+        () -> {
+          FileStatus status = statNullableAcrossFileSystems(path, followSymlinks);
+          return status != null && status.isFile();
+        });
   }
 
   @Override
   public boolean isSpecialFile(PathFragment path, boolean followSymlinks) {
-    return fsForPath(path).isSpecialFile(path, followSymlinks);
+    return runScopedQuery(
+        path,
+        (fileSystem, directPath) -> fileSystem.isSpecialFile(directPath, followSymlinks),
+        () -> {
+          FileStatus status = statNullableAcrossFileSystems(path, followSymlinks);
+          return status != null && status.isSpecialFile();
+        });
   }
 
   @Override
   public boolean isSymbolicLink(PathFragment path) {
-    return fsForPath(path).isSymbolicLink(path);
+    return runScopedQuery(
+        path,
+        FileSystem::isSymbolicLink,
+        () -> {
+          FileStatus status = statNullableAcrossFileSystems(path, /* followSymlinks= */ false);
+          return status != null && status.isSymbolicLink();
+        });
   }
 
   @Override
   public boolean isDirectory(PathFragment path, boolean followSymlinks) {
-    return fsForPath(path).isDirectory(path, followSymlinks);
+    return runScopedQuery(
+        path,
+        (fileSystem, directPath) -> fileSystem.isDirectory(directPath, followSymlinks),
+        () -> {
+          FileStatus status = statNullableAcrossFileSystems(path, followSymlinks);
+          return status != null && status.isDirectory();
+        });
   }
 
   @Override
   public PathFragment readSymbolicLinkUnchecked(PathFragment path) throws IOException {
-    return fsForPath(path).readSymbolicLinkUnchecked(path);
+    return runRoutedOperation(
+        path,
+        FollowMode.FOLLOW_PARENT,
+        (fileSystem, canonicalPath) -> fileSystem.readSymbolicLinkUnchecked(canonicalPath));
   }
 
   @Override
   public Collection<Dirent> readdir(PathFragment path, boolean followSymlinks) throws IOException {
-    return fsForPath(path).readdir(path, followSymlinks);
+    return runRoutedOperation(
+        path,
+        FollowMode.FOLLOW_ALL,
+        (fileSystem, directPath) -> fileSystem.readdir(directPath, followSymlinks),
+        routedPath -> {
+          Collection<Dirent> dirents =
+              routedPath.owner().readdir(routedPath.canonicalPath(), /* followSymlinks= */ false);
+          return followDirentSymlinks(routedPath.canonicalPath(), dirents, followSymlinks);
+        });
+  }
+
+  private Collection<Dirent> followDirentSymlinks(
+      PathFragment directoryPath, Collection<Dirent> dirents, boolean followSymlinks) {
+    if (!followSymlinks) {
+      return dirents;
+    }
+    List<Dirent> followedDirents = Lists.newArrayListWithCapacity(dirents.size());
+    for (Dirent dirent : dirents) {
+      if (dirent.getType() != Dirent.Type.SYMLINK) {
+        followedDirents.add(dirent);
+        continue;
+      }
+      FileStatus status;
+      try {
+        status =
+            routeAcrossFileSystems(directoryPath.getChild(dirent.getName()), FollowMode.FOLLOW_ALL)
+                .status();
+      } catch (IOException e) {
+        status = null;
+      }
+      followedDirents.add(new Dirent(dirent.getName(), direntFromStat(status)));
+    }
+    return followedDirents;
   }
 
   @Override
   public void chmod(PathFragment path, int mode) throws IOException {
-    fsForPath(path).chmod(path, mode);
+    RoutedPath routedPath = route(path, FollowMode.FOLLOW_ALL);
+    routedPath.owner().chmod(routedPath.canonicalPath(), mode);
   }
 
   @Override
   public void createHardLink(PathFragment linkPath, PathFragment originalPath) throws IOException {
-    fsForPath(linkPath).createHardLink(linkPath, originalPath);
+    RoutedPath routedLink = route(linkPath, FollowMode.FOLLOW_PARENT);
+    RoutedPath routedOriginal = route(originalPath, FollowMode.FOLLOW_PARENT);
+    clearCanonicalization(linkPath, routedLink);
+    if (routedLink.owner() != routedOriginal.owner()) {
+      throw new IOException(
+          "Cannot create hard link across file systems: " + linkPath + " to " + originalPath);
+    }
+    routedLink.owner().createHardLink(routedLink.canonicalPath(), routedOriginal.canonicalPath());
   }
 
   @Override
@@ -683,7 +1495,10 @@ public final class RemoteExternalOverlayFileSystem extends FileSystem {
 
   @Override
   public PathFragment createTempDirectory(PathFragment parent, String prefix) throws IOException {
-    return fsForPath(parent).createTempDirectory(parent, prefix);
+    RoutedPath routedParent = route(parent, FollowMode.FOLLOW_ALL);
+    PathFragment created =
+        routedParent.owner().createTempDirectory(routedParent.canonicalPath(), prefix);
+    return parent.getChild(created.getBaseName());
   }
 
   private final class RemoteExternalFileSystem

@@ -29,6 +29,11 @@ import com.google.devtools.build.lib.vfs.PathFragment;
 import com.google.devtools.build.lib.vfs.inmemoryfs.InMemoryFileSystem;
 import java.io.FileNotFoundException;
 import java.io.IOException;
+import java.util.HashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -51,6 +56,11 @@ public final class PathCanonicalizerTest {
   private final PathCanonicalizer canonicalizer = new PathCanonicalizer(this::resolve);
 
   private @Nullable PathFragment resolve(PathFragment pathFragment) throws IOException {
+    return resolve(fs, pathFragment);
+  }
+
+  private static @Nullable PathFragment resolve(FileSystem fs, PathFragment pathFragment)
+      throws IOException {
     Path path = fs.getPath(pathFragment);
     try {
       return path.readSymbolicLink();
@@ -149,6 +159,208 @@ public final class PathCanonicalizerTest {
     createNonSymlink("/d/c");
     assertSuccess("/a/b/c", "/d/c");
     assertSuccess("/a/b/c", "/d/c");
+  }
+
+  @Test
+  public void testUncacheableNonSymlinkIsResolvedAgain() throws Exception {
+    var uncachedCanonicalizer =
+        PathCanonicalizer.createSelective(
+            path -> new PathCanonicalizer.Resolution(resolve(path), /* cacheable= */ false));
+    createNonSymlink("/a/b");
+    assertThat(uncachedCanonicalizer.resolveSymbolicLinks(pathFragment("/a/b")))
+        .isEqualTo(pathFragment("/a/b"));
+
+    fs.getPath(pathFragment("/a/b")).delete();
+    createSymlink("/a/b", "/d");
+    createNonSymlink("/d");
+
+    assertThat(uncachedCanonicalizer.resolveSymbolicLinks(pathFragment("/a/b")))
+        .isEqualTo(pathFragment("/d"));
+  }
+
+  @Test
+  public void testUncacheableSymlinkIsResolvedAgain() throws Exception {
+    var uncachedCanonicalizer =
+        PathCanonicalizer.createSelective(
+            path -> new PathCanonicalizer.Resolution(resolve(path), /* cacheable= */ false));
+    createSymlink("/a/b", "/first");
+    createNonSymlink("/first");
+    createNonSymlink("/second");
+    assertThat(uncachedCanonicalizer.resolveSymbolicLinks(pathFragment("/a/b")))
+        .isEqualTo(pathFragment("/first"));
+
+    fs.getPath(pathFragment("/a/b")).delete();
+    createSymlink("/a/b", "/second");
+
+    assertThat(uncachedCanonicalizer.resolveSymbolicLinks(pathFragment("/a/b")))
+        .isEqualTo(pathFragment("/second"));
+  }
+
+  @Test
+  public void testSelectiveCacheReusesDescendantsAndReresolvesAncestors() throws Exception {
+    var resolveCounts = new HashMap<PathFragment, Integer>();
+    var cacheabilityCounts = new HashMap<PathFragment, Integer>();
+    var selectiveCanonicalizer =
+        PathCanonicalizer.createSelective(
+            path -> {
+              resolveCounts.merge(path, 1, Integer::sum);
+              cacheabilityCounts.merge(path, 1, Integer::sum);
+              return new PathCanonicalizer.Resolution(
+                  resolve(path), /* cacheable= */ path.segmentCount() >= 2);
+            });
+    createNonSymlink("/a/cacheable/file");
+
+    assertThat(selectiveCanonicalizer.resolveSymbolicLinks(pathFragment("/a/cacheable/file")))
+        .isEqualTo(pathFragment("/a/cacheable/file"));
+    assertThat(selectiveCanonicalizer.resolveSymbolicLinks(pathFragment("/a/cacheable/file")))
+        .isEqualTo(pathFragment("/a/cacheable/file"));
+    assertThat(resolveCounts.get(pathFragment("/a"))).isEqualTo(2);
+    assertThat(resolveCounts.get(pathFragment("/a/cacheable"))).isEqualTo(1);
+    assertThat(resolveCounts.get(pathFragment("/a/cacheable/file"))).isEqualTo(1);
+    assertThat(cacheabilityCounts.get(pathFragment("/a"))).isEqualTo(2);
+    assertThat(cacheabilityCounts.get(pathFragment("/a/cacheable"))).isEqualTo(1);
+    assertThat(cacheabilityCounts.get(pathFragment("/a/cacheable/file"))).isEqualTo(1);
+
+    fs.getPath(pathFragment("/a")).deleteTree();
+    createNonSymlink("/b/cacheable/file");
+    createSymlink("/a", "/b");
+
+    assertThat(selectiveCanonicalizer.resolveSymbolicLinks(pathFragment("/a/cacheable/file")))
+        .isEqualTo(pathFragment("/b/cacheable/file"));
+    assertThat(selectiveCanonicalizer.resolveSymbolicLinks(pathFragment("/a/cacheable/file")))
+        .isEqualTo(pathFragment("/b/cacheable/file"));
+    assertThat(resolveCounts.get(pathFragment("/a"))).isEqualTo(4);
+    assertThat(resolveCounts.get(pathFragment("/b"))).isEqualTo(2);
+    assertThat(resolveCounts.get(pathFragment("/b/cacheable"))).isEqualTo(1);
+    assertThat(resolveCounts.get(pathFragment("/b/cacheable/file"))).isEqualTo(1);
+    assertThat(cacheabilityCounts.get(pathFragment("/a"))).isEqualTo(4);
+    assertThat(cacheabilityCounts.get(pathFragment("/b"))).isEqualTo(2);
+    assertThat(cacheabilityCounts.get(pathFragment("/b/cacheable"))).isEqualTo(1);
+    assertThat(cacheabilityCounts.get(pathFragment("/b/cacheable/file"))).isEqualTo(1);
+
+    selectiveCanonicalizer.clearPrefix(pathFragment("/b/cacheable"));
+    assertThat(selectiveCanonicalizer.resolveSymbolicLinks(pathFragment("/a/cacheable/file")))
+        .isEqualTo(pathFragment("/b/cacheable/file"));
+    assertThat(resolveCounts.get(pathFragment("/a"))).isEqualTo(5);
+    assertThat(resolveCounts.get(pathFragment("/b"))).isEqualTo(3);
+    assertThat(resolveCounts.get(pathFragment("/b/cacheable"))).isEqualTo(2);
+    assertThat(resolveCounts.get(pathFragment("/b/cacheable/file"))).isEqualTo(2);
+    assertThat(cacheabilityCounts.get(pathFragment("/a"))).isEqualTo(5);
+    assertThat(cacheabilityCounts.get(pathFragment("/b"))).isEqualTo(3);
+    assertThat(cacheabilityCounts.get(pathFragment("/b/cacheable"))).isEqualTo(2);
+    assertThat(cacheabilityCounts.get(pathFragment("/b/cacheable/file"))).isEqualTo(2);
+  }
+
+  @Test
+  public void testSelectiveResolutionBindsCacheabilityToResolvedOwner() throws Exception {
+    FileSystem cacheableFs = new InMemoryFileSystem(DigestHashFunction.SHA256);
+    FileSystem mutableFs = new InMemoryFileSystem(DigestHashFunction.SHA256);
+    PathFragment linkPath = pathFragment("/repo/link");
+    PathFragment firstTarget = pathFragment("/first");
+    PathFragment secondTarget = pathFragment("/second");
+
+    cacheableFs.getPath(linkPath).getParentDirectory().createDirectoryAndParents();
+    cacheableFs.getPath(linkPath).createSymbolicLink(pathFragment("/stable"));
+    FileSystemUtils.writeContent(cacheableFs.getPath(pathFragment("/stable")), UTF_8, "");
+    mutableFs.getPath(linkPath).getParentDirectory().createDirectoryAndParents();
+    mutableFs.getPath(linkPath).createSymbolicLink(firstTarget);
+    FileSystemUtils.writeContent(mutableFs.getPath(firstTarget), UTF_8, "");
+    FileSystemUtils.writeContent(mutableFs.getPath(secondTarget), UTF_8, "");
+
+    class SwitchingResolver implements PathCanonicalizer.SelectiveResolver {
+      private FileSystem owner = cacheableFs;
+      private boolean switchOwnerBeforeResolvingLink = true;
+      private int mutableLinkResolutions;
+
+      @Override
+      public PathCanonicalizer.Resolution resolveOneLink(PathFragment path) throws IOException {
+        if (path.equals(linkPath) && switchOwnerBeforeResolvingLink) {
+          // Simulate an ownership switch at the boundary that separated the old cacheability and
+          // resolution callbacks. The combined callback selects the new owner before resolving.
+          owner = mutableFs;
+          switchOwnerBeforeResolvingLink = false;
+        }
+        FileSystem selectedOwner = owner;
+        if (selectedOwner == mutableFs && path.equals(linkPath)) {
+          mutableLinkResolutions++;
+        }
+        return new PathCanonicalizer.Resolution(
+            resolve(selectedOwner, path), /* cacheable= */ selectedOwner == cacheableFs);
+      }
+    }
+
+    var resolver = new SwitchingResolver();
+    var selectiveCanonicalizer = PathCanonicalizer.createSelective(resolver);
+    assertThat(selectiveCanonicalizer.resolveSymbolicLinks(linkPath)).isEqualTo(firstTarget);
+
+    mutableFs.getPath(linkPath).delete();
+    mutableFs.getPath(linkPath).createSymbolicLink(secondTarget);
+
+    assertThat(selectiveCanonicalizer.resolveSymbolicLinks(linkPath)).isEqualTo(secondTarget);
+    assertThat(resolver.mutableLinkResolutions).isEqualTo(2);
+  }
+
+  @Test
+  public void testSelectiveClearPreventsInFlightPublication() throws Exception {
+    PathFragment repoPath = pathFragment("/repo");
+    PathFragment childPath = repoPath.getRelative("child");
+    PathFragment newRepoPath = pathFragment("/new-repo");
+    PathFragment newChildPath = newRepoPath.getRelative("child");
+    var switched = new AtomicBoolean();
+    var repoResolutionStarted = new CountDownLatch(1);
+    var allowRepoResolution = new CountDownLatch(1);
+    PathCanonicalizer.SelectiveResolver resolver =
+        path -> {
+          PathFragment targetPath = path.equals(repoPath) && switched.get() ? newRepoPath : null;
+          if (path.equals(repoPath) && !switched.get()) {
+            // Capture the old result, then pause immediately before returning it for publication.
+            repoResolutionStarted.countDown();
+            try {
+              allowRepoResolution.await();
+            } catch (InterruptedException e) {
+              Thread.currentThread().interrupt();
+              throw new IOException(e);
+            }
+          }
+          return new PathCanonicalizer.Resolution(targetPath, /* cacheable= */ true);
+        };
+    var selectiveCanonicalizer = PathCanonicalizer.createSelective(resolver);
+    var executor = Executors.newSingleThreadExecutor();
+    try {
+      var firstLookup =
+          executor.submit(() -> selectiveCanonicalizer.resolveSymbolicLinks(childPath));
+      assertThat(repoResolutionStarted.await(5, TimeUnit.SECONDS)).isTrue();
+
+      selectiveCanonicalizer.clearPrefix(repoPath);
+      switched.set(true);
+      selectiveCanonicalizer.clearPrefix(repoPath);
+      allowRepoResolution.countDown();
+
+      assertThat(firstLookup.get(5, TimeUnit.SECONDS)).isEqualTo(newChildPath);
+      assertThat(selectiveCanonicalizer.resolveSymbolicLinks(childPath)).isEqualTo(newChildPath);
+    } finally {
+      allowRepoResolution.countDown();
+      executor.shutdownNow();
+    }
+  }
+
+  @Test
+  public void testSelectiveUncacheablePathsAreNotRetained() throws Exception {
+    PathFragment stablePath = pathFragment("/stable");
+    var selectiveCanonicalizer =
+        PathCanonicalizer.createSelective(
+            path ->
+                new PathCanonicalizer.Resolution(
+                    /* targetPath= */ null, /* cacheable= */ path.equals(stablePath)));
+    assertThat(selectiveCanonicalizer.resolveSymbolicLinks(stablePath)).isEqualTo(stablePath);
+    int stableNodeCount = selectiveCanonicalizer.nodeCountForTesting();
+
+    for (int i = 0; i < 100; i++) {
+      PathFragment path = stablePath.getRelative("native-" + i + "/file");
+      assertThat(selectiveCanonicalizer.resolveSymbolicLinks(path)).isEqualTo(path);
+    }
+
+    assertThat(selectiveCanonicalizer.nodeCountForTesting()).isEqualTo(stableNodeCount);
   }
 
   @Test

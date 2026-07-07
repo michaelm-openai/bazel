@@ -369,6 +369,25 @@ public abstract class ActionInputPrefetcherTestBase {
   }
 
   @Test
+  public void prefetchFiles_matchingSymlinkAlreadyExists_doesNotReplant() throws Exception {
+    Map<ActionInput, FileArtifactValue> metadata = new HashMap<>();
+    Map<HashCode, byte[]> cas = new HashMap<>();
+    PathFragment resolvedPath = artifactRoot.getRoot().asPath().getChild("target").asFragment();
+    Artifact a = createRemoteArtifact("file", "hello world", resolvedPath, metadata, cas);
+    a.getPath().createSymbolicLink(resolvedPath);
+    AbstractActionInputPrefetcher prefetcher = createPrefetcher(cas);
+    reset(fs);
+
+    wait(
+        prefetcher.prefetchFilesInterruptibly(
+            action, metadata.keySet(), metadata::get, Priority.MEDIUM, Reason.INPUTS));
+
+    verify(fs, never()).delete(a.getPath().asFragment());
+    assertThat(a.getPath().readSymbolicLink()).isEqualTo(resolvedPath);
+    assertThat(FileSystemUtils.readContent(a.getPath(), UTF_8)).isEqualTo("hello world");
+  }
+
+  @Test
   public void prefetchFiles_downloadRemoteTrees() throws Exception {
     Map<ActionInput, FileArtifactValue> metadata = new HashMap<>();
     Map<HashCode, byte[]> cas = new HashMap<>();

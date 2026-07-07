@@ -301,6 +301,16 @@ public class RemoteActionFileSystem extends FileSystem implements PathCanonicali
         && fileStatusWithMetadata.getMetadata().isRemote();
   }
 
+  /** Returns whether the resolved path is present on the host file system. */
+  boolean isAvailableLocally(PathFragment path) {
+    try {
+      path = resolveSymbolicLinks(path).asFragment();
+    } catch (IOException ignored) {
+      return false;
+    }
+    return getHostFileSystem().exists(path);
+  }
+
   public void updateContext(ActionExecutionMetadata action) {
     this.action = action;
   }
@@ -377,6 +387,7 @@ public class RemoteActionFileSystem extends FileSystem implements PathCanonicali
 
   @Override
   public InputStream getInputStream(PathFragment path) throws IOException {
+    path = resolveSymbolicLinks(path).asFragment();
     try {
       getFromFuture(downloadIfRemote(path));
     } catch (InterruptedException e) {

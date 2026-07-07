@@ -731,6 +731,7 @@ java_library(
     deps = [
         ":abstract_action_input_prefetcher",
         ":combined_cache",
+        ":path_canonicalizer",
         ":remote_action_file_system",
         "//src/main/java/com/google/devtools/build/lib/actions",
         "//src/main/java/com/google/devtools/build/lib/actions:action_input_helper",

@@ -204,6 +204,21 @@ public final class RemoteActionFileSystemTest extends RemoteActionFileSystemTest
   }
 
   @Test
+  public void localAccess_resolvesRemoteSymlinkToLocalTarget() throws Exception {
+    RemoteActionFileSystem actionFs = (RemoteActionFileSystem) createActionFileSystem();
+    PathFragment linkPath = getOutputPath("link");
+    PathFragment targetPath = getOutputPath("target");
+    actionFs.getRemoteOutputTree().createDirectoryAndParents(linkPath.getParentDirectory());
+    actionFs.getRemoteOutputTree().createSymbolicLink(linkPath, targetPath);
+    byte[] contents = {1};
+    FileSystemUtils.writeContent(actionFs.getLocalFileSystem().getPath(targetPath), contents);
+
+    assertThat(actionFs.getHostFileSystem().exists(linkPath)).isFalse();
+    assertThat(actionFs.isAvailableLocally(linkPath)).isTrue();
+    assertThat(FileSystemUtils.readContent(actionFs.getPath(linkPath))).isEqualTo(contents);
+  }
+
+  @Test
   public void statAndExists_fromInputArtifactData_file() throws Exception {
     ActionInputMap inputs = new ActionInputMap(1);
     Artifact artifact = createLocalArtifact("local-file", "local contents", inputs);

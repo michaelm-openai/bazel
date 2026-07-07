@@ -27,9 +27,8 @@ import javax.annotation.Nullable;
  * Canonicalizes paths like {@link FileSystem#resolveSymbolicLinks}, while storing the intermediate
  * results in a trie so they can be reused by future canonicalizations.
  *
- * <p>This is an implementation detail of {@link RemoteActionFileSystem}, factored out for testing.
- * Because {@link RemoteActionFileSystem} implements a union filesystem and must account for the
- * possibility of symlinks straddling the underlying filesystems, the performance of large
+ * <p>This is an implementation detail of the union filesystems in this package, factored out for
+ * testing. Because their symlinks can straddle underlying filesystems, the performance of large
  * filesystem scans can be greatly improved with a custom {@link FileSystem#resolveSymbolicLinks}
  * implementation that leverages the trie to avoid repeated work.
  *
@@ -54,25 +53,70 @@ final class PathCanonicalizer {
     PathFragment resolveOneLink(PathFragment path) throws IOException;
   }
 
+  /** The raw symlink target, or null for a non-link, and whether that exact result is cacheable. */
+  record Resolution(@Nullable PathFragment targetPath, boolean cacheable) {}
+
+  @FunctionalInterface
+  interface SelectiveResolver {
+    /**
+     * Resolves one path component and reports whether that exact result can be reused.
+     *
+     * <p>The backing file system must be selected once, and both the resolution and cacheability
+     * decision must describe that backing. Cacheable results must remain stable until their prefix
+     * is cleared.
+     */
+    Resolution resolveOneLink(PathFragment path) throws IOException;
+  }
+
   /** A trie node. */
-  private sealed interface Node {}
+  private sealed interface Node permits SymlinkNode, ParentNode {}
 
   /** A trie node corresponding to a symlink. */
   private record SymlinkNode(PathFragment targetPath) implements Node {}
 
-  /** A trie node not corresponding to a symlink. */
-  private static final class NonSymlinkNode extends ConcurrentHashMap<String, Node>
-      implements Node {
-    NonSymlinkNode() {
+  /** A trie node that can have children. */
+  private abstract static sealed class ParentNode extends ConcurrentHashMap<String, Node>
+      implements Node permits NonSymlinkNode, UncachedNode {
+    ParentNode() {
       super(/* initialCapacity= */ 1);
     }
   }
 
-  private final Resolver resolver;
+  /** A cached trie node not corresponding to a symlink. */
+  private static final class NonSymlinkNode extends ParentNode {}
+
+  /** A trie node whose file type and symlink target must be resolved on every access. */
+  private static final class UncachedNode extends ParentNode {}
+
+  /** Connects a temporary chain of uncached nodes to the retained trie. */
+  private record PendingAttachment(ParentNode parent, String segment, UncachedNode child) {}
+
+  @Nullable private final Resolver resolver;
+  @Nullable private final SelectiveResolver selectiveResolver;
   private final NonSymlinkNode root = new NonSymlinkNode();
+  // Selective resolver callbacks perform I/O without holding this lock. Pairing publication with
+  // invalidation and checking the generation prevents a callback that spans clearPrefix from
+  // publishing its old result afterward.
+  private final Object cacheMutationLock = new Object();
+  private volatile long generation;
 
   PathCanonicalizer(Resolver resolver) {
     this.resolver = resolver;
+    this.selectiveResolver = null;
+  }
+
+  /**
+   * Creates a canonicalizer that reuses results according to {@code selectiveResolver}. Uncacheable
+   * nodes remain in the trie solely to anchor cacheable descendants.
+   */
+  static PathCanonicalizer createSelective(SelectiveResolver selectiveResolver) {
+    return new PathCanonicalizer(/* resolver= */ null, selectiveResolver);
+  }
+
+  private PathCanonicalizer(
+      @Nullable Resolver resolver, @Nullable SelectiveResolver selectiveResolver) {
+    this.resolver = resolver;
+    this.selectiveResolver = selectiveResolver;
   }
 
   /** Returns the root node for an absolute path. */
@@ -97,11 +141,18 @@ final class PathCanonicalizer {
    * @return the canonical path.
    */
   private PathFragment resolveSymbolicLinks(PathFragment path, int maxLinks) throws IOException {
+    return selectiveResolver == null
+        ? resolveSymbolicLinksCached(path, maxLinks)
+        : resolveSymbolicLinksSelective(path, maxLinks);
+  }
+
+  private PathFragment resolveSymbolicLinksCached(PathFragment path, int maxLinks)
+      throws IOException {
     // This code is carefully written to be as fast as possible when the path is already canonical
     // and has been previously cached. Avoid making changes without benchmarking. A tree artifact
     // with hundreds of thousands of files makes for a good benchmark.
 
-    NonSymlinkNode node = getRootNode(path);
+    ParentNode node = getRootNode(path);
     Iterable<String> segments = path.segments();
     int segmentIndex = 0;
 
@@ -116,46 +167,162 @@ final class PathCanonicalizer {
       Node nextNode = node.get(segment);
       if (nextNode == null) {
         PathFragment naivePath = path.subFragment(0, segmentIndex + 1);
+        long expectedGeneration = generation;
         PathFragment targetPath = resolver.resolveOneLink(naivePath);
-        nextNode =
-            node.computeIfAbsent(
-                segment,
-                unused -> targetPath != null ? new SymlinkNode(targetPath) : new NonSymlinkNode());
+        Node resolvedNode = targetPath != null ? new SymlinkNode(targetPath) : new NonSymlinkNode();
+        synchronized (cacheMutationLock) {
+          if (generation == expectedGeneration) {
+            Node existingNode = node.putIfAbsent(segment, resolvedNode);
+            nextNode = existingNode != null ? existingNode : resolvedNode;
+          }
+        }
+        if (nextNode == null) {
+          // The resolver crossed an invalidation. Start over from the retained trie rather than
+          // publishing into a node that may have been detached by clearPrefix.
+          return resolveSymbolicLinksCached(path, maxLinks);
+        }
       }
 
       switch (nextNode) {
-        case SymlinkNode(PathFragment targetPath) -> {
-          if (maxLinks == 0) {
-            throw new FileSymlinkLoopException(
-                path.getPathString() + FileSystem.ERR_TOO_MANY_SYMLINKS);
-          }
-          maxLinks--;
-
-          // Compute the path obtained by resolving the symlink.
-          // Note that path normalization already handles uplevel references.
-          PathFragment newPath;
-          if (targetPath.isAbsolute()) {
-            newPath = targetPath.getRelative(path.subFragment(segmentIndex + 1));
-          } else {
-            newPath =
-                path.subFragment(0, segmentIndex)
-                    .getRelative(targetPath)
-                    .getRelative(path.subFragment(segmentIndex + 1));
-          }
-
-          // For absolute symlinks, we must start over.
-          // For relative symlinks, it would have been possible to restart after the already
-          // canonicalized prefix, but they're too rare to be worth optimizing for.
-          return resolveSymbolicLinks(newPath, maxLinks);
+        case SymlinkNode(PathFragment resolvedTarget) -> {
+          return followSymlink(path, segmentIndex, resolvedTarget, maxLinks);
         }
-        case NonSymlinkNode nonSymlinkNode -> {
-          node = nonSymlinkNode;
+        case ParentNode parentNode -> {
+          node = parentNode;
           segmentIndex++;
         }
       }
     }
 
     return path;
+  }
+
+  private PathFragment resolveSymbolicLinksSelective(PathFragment path, int maxLinks)
+      throws IOException {
+    while (true) {
+      long expectedGeneration = generation;
+      PathFragment result = resolveSymbolicLinksSelective(path, maxLinks, expectedGeneration);
+      if (result != null && generation == expectedGeneration) {
+        return result;
+      }
+    }
+  }
+
+  @Nullable
+  private PathFragment resolveSymbolicLinksSelective(
+      PathFragment path, int maxLinks, long expectedGeneration) throws IOException {
+    ParentNode node = getRootNode(path);
+    Iterable<String> segments = path.segments();
+    int segmentIndex = 0;
+    PendingAttachment pendingAttachment = null;
+
+    for (String segment : segments) {
+      Node nextNode = node.get(segment);
+      if (nextNode == null || nextNode instanceof UncachedNode) {
+        PathFragment naivePath = path.subFragment(0, segmentIndex + 1);
+        Resolution resolution = selectiveResolver.resolveOneLink(naivePath);
+        if (generation != expectedGeneration) {
+          return null;
+        }
+        PathFragment targetPath = resolution.targetPath();
+        if (resolution.cacheable()) {
+          nextNode = targetPath != null ? new SymlinkNode(targetPath) : new NonSymlinkNode();
+          if (!publish(node, segment, nextNode, pendingAttachment, expectedGeneration)) {
+            return null;
+          }
+          pendingAttachment = null;
+        } else {
+          if (targetPath != null) {
+            nextNode = new SymlinkNode(targetPath);
+          } else if (nextNode instanceof UncachedNode) {
+            // Retained uncached nodes have stable descendants and must be revisited on every
+            // lookup, but can still serve as their anchor while they remain non-symlinks.
+          } else {
+            var uncachedNode = new UncachedNode();
+            if (pendingAttachment == null) {
+              pendingAttachment = new PendingAttachment(node, segment, uncachedNode);
+            } else {
+              // This node is not reachable from the retained trie yet, so no synchronization is
+              // needed. The full chain is attached only if it reaches a cacheable descendant.
+              node.put(segment, uncachedNode);
+            }
+            nextNode = uncachedNode;
+          }
+        }
+      }
+      switch (nextNode) {
+        case SymlinkNode(PathFragment resolvedTarget) -> {
+          return followSymlink(path, segmentIndex, resolvedTarget, maxLinks, expectedGeneration);
+        }
+        case ParentNode parentNode -> {
+          node = parentNode;
+          segmentIndex++;
+        }
+      }
+    }
+
+    return path;
+  }
+
+  /** Publishes a cacheable result and any uncached ancestors needed to reach it. */
+  private boolean publish(
+      ParentNode parent,
+      String segment,
+      Node result,
+      @Nullable PendingAttachment pendingAttachment,
+      long expectedGeneration) {
+    synchronized (cacheMutationLock) {
+      if (generation != expectedGeneration) {
+        return false;
+      }
+      parent.put(segment, result);
+      if (pendingAttachment != null
+          && pendingAttachment
+                  .parent()
+                  .putIfAbsent(pendingAttachment.segment(), pendingAttachment.child())
+              != null) {
+        // Another lookup attached a chain at the same location. Restart from the retained trie
+        // instead of publishing into a detached chain.
+        return false;
+      }
+      return true;
+    }
+  }
+
+  private PathFragment followSymlink(
+      PathFragment path, int segmentIndex, PathFragment targetPath, int maxLinks)
+      throws IOException {
+    return followSymlink(path, segmentIndex, targetPath, maxLinks, /* expectedGeneration= */ -1);
+  }
+
+  @Nullable
+  private PathFragment followSymlink(
+      PathFragment path,
+      int segmentIndex,
+      PathFragment targetPath,
+      int maxLinks,
+      long expectedGeneration)
+      throws IOException {
+    if (maxLinks == 0) {
+      throw new FileSymlinkLoopException(path.getPathString() + FileSystem.ERR_TOO_MANY_SYMLINKS);
+    }
+
+    // Path normalization handles uplevel references in relative targets.
+    PathFragment newPath;
+    if (targetPath.isAbsolute()) {
+      newPath = targetPath.getRelative(path.subFragment(segmentIndex + 1));
+    } else {
+      newPath =
+          path.subFragment(0, segmentIndex)
+              .getRelative(targetPath)
+              .getRelative(path.subFragment(segmentIndex + 1));
+    }
+
+    // For absolute symlinks, we must start over. For relative symlinks, it would be possible to
+    // restart after the already canonicalized prefix, but they're too rare to be worth optimizing.
+    return selectiveResolver == null
+        ? resolveSymbolicLinksCached(newPath, maxLinks - 1)
+        : resolveSymbolicLinksSelective(newPath, maxLinks - 1, expectedGeneration);
   }
 
   /**
@@ -174,35 +341,51 @@ final class PathCanonicalizer {
 
   /** Removes cached information for a path prefix. */
   void clearPrefix(PathFragment pathPrefix) {
-    Node node = getRootNode(pathPrefix);
-    NonSymlinkNode parent = null;
-    String parentSegment = null;
-    Iterator<String> segments = pathPrefix.segments().iterator();
-    boolean hasNext = segments.hasNext();
+    synchronized (cacheMutationLock) {
+      generation++;
+      Node node = getRootNode(pathPrefix);
+      ParentNode parent = null;
+      String parentSegment = null;
+      Iterator<String> segments = pathPrefix.segments().iterator();
+      boolean hasNext = segments.hasNext();
 
-    while (node != null && hasNext) {
-      String segment = segments.next();
-      hasNext = segments.hasNext();
+      while (node != null && hasNext) {
+        String segment = segments.next();
+        hasNext = segments.hasNext();
 
-      switch (node) {
-        case SymlinkNode symlinkNode -> {
-          // Invalidate all intermediate symlinks.
-          if (parent != null) {
-            parent.remove(parentSegment);
+        switch (node) {
+          case SymlinkNode symlinkNode -> {
+            // Invalidate all intermediate symlinks.
+            if (parent != null) {
+              parent.remove(parentSegment);
+            }
+            return;
           }
-          return;
-        }
-        case NonSymlinkNode nonSymlinkNode -> {
-          if (!hasNext) {
-            // Found the path prefix.
-            nonSymlinkNode.remove(segment);
-          } else {
-            parent = nonSymlinkNode;
-            parentSegment = segment;
-            node = nonSymlinkNode.get(segment);
+          case ParentNode parentNode -> {
+            if (!hasNext) {
+              // Found the path prefix.
+              parentNode.remove(segment);
+            } else {
+              parent = parentNode;
+              parentSegment = segment;
+              node = parentNode.get(segment);
+            }
           }
         }
       }
     }
+  }
+
+  /** Returns the number of nodes retained by the trie. */
+  int nodeCountForTesting() {
+    return countNodes(root);
+  }
+
+  private static int countNodes(Node node) {
+    return switch (node) {
+      case SymlinkNode unused -> 1;
+      case ParentNode parentNode ->
+          1 + parentNode.values().stream().mapToInt(PathCanonicalizer::countNodes).sum();
+    };
   }
 }

@@ -15,6 +15,7 @@
 # pylint: disable=g-long-ternary
 # pylint: disable=g-bad-todo
 
+import hashlib
 import json
 import os
 import re
@@ -27,14 +28,14 @@ class RemoteRepoContentsCacheTest(test_base.TestBase):
 
   def setUp(self):
     test_base.TestBase.setUp(self)
-    worker_port = self.StartRemoteWorker()
+    self._worker_port = self.StartRemoteWorker()
     self.ScratchFile(
         '.bazelrc',
         [
             'startup --experimental_remote_repo_contents_cache',
             # Only use the remote repo contents cache.
             'common --repo_contents_cache=',
-            'common --remote_cache=grpc://localhost:' + str(worker_port),
+            'common --remote_cache=grpc://localhost:' + str(self._worker_port),
             'common --auth_enabled=false',
             'common --remote_timeout=3600s',
             'common --verbose_failures',
@@ -1141,9 +1142,8 @@ class RemoteRepoContentsCacheTest(test_base.TestBase):
   def testRepoWithSymlinkChainIntoMainRepoIsNotCached(self):
     # A repo containing a symlink chain that ends with a symlink pointing at a
     # file in the main repo must not be added to the remote repo contents
-    # cache: when restored from the cache, the chain would only exist in the
-    # in-memory overlay file system, which can't resolve symlinks that cross
-    # over into the native file system.
+    # cache. Supporting these links would add complexity for little gain since
+    # files in the main repo are already available locally.
     if self.IsWindows():
       self.ScratchFile(
           '.bazelrc',
@@ -1360,6 +1360,307 @@ class RemoteRepoContentsCacheTest(test_base.TestBase):
     self.assertEqual(action_layout, full_layout)
     self.assertEqual(action_layout['type'], 'symlink')
     self.assertEqual(action_layout['resolves_to'], 'dep_hello')
+
+  def testRepoExternalSymlinkWithNativeTargetRepo(self):
+    if self.IsWindows():
+      self.ScratchFile(
+          '.bazelrc',
+          ['startup --windows_enable_symlinks'],
+          mode='a',
+      )
+    self.ScratchFile(
+        'MODULE.bazel',
+        [
+            'dep_repo_rule = use_repo_rule("//:dep_repo.bzl", "dep_repo_rule")',
+            'dep_repo_rule(name = "dep_repo")',
+            'repo = use_repo_rule("//:repo.bzl", "repo")',
+            (
+                'repo(name = "my_repo", external_file ='
+                ' "@dep_repo//:dep_data.txt")'
+            ),
+            (
+                'materializer_rule ='
+                ' use_repo_rule("//:materializer.bzl", "materializer_rule")'
+            ),
+            (
+                'materializer_rule(name = "materializer", dep_file ='
+                ' "@dep_repo//:dep_data.txt")'
+            ),
+        ],
+    )
+    self.ScratchFile('BUILD.bazel')
+    self.ScratchFile(
+        'dep_repo.bzl',
+        [
+            'def _dep_repo_impl(rctx):',
+            '  rctx.file("BUILD", "exports_files([\'dep_data.txt\'])")',
+            '  rctx.file("dep_data.txt", "dep_hello")',
+            '  print("JUST FETCHED DEP_REPO")',
+            '  return rctx.repo_metadata(reproducible=True)',
+            'dep_repo_rule = repository_rule(_dep_repo_impl)',
+        ],
+    )
+    self.ScratchFile(
+        'repo.bzl',
+        [
+            'def _repo_impl(rctx):',
+            (
+                '  rctx.file("BUILD", "filegroup(name=\'haha\')\\n'
+                "exports_files(['external_link.txt'])\")"
+            ),
+            '  rctx.symlink(rctx.attr.external_file, "external_link.txt")',
+            '  print("JUST FETCHED MY_REPO")',
+            '  return rctx.repo_metadata(reproducible=True)',
+            (
+                'repo = repository_rule(_repo_impl,'
+                ' attrs={"external_file": attr.label()})'
+            ),
+        ],
+    )
+    self.ScratchFile(
+        'materializer.bzl',
+        [
+            'def _materializer_impl(rctx):',
+            '  rctx.file("BUILD", "filegroup(name=\'haha\')")',
+            '  rctx.read(rctx.attr.dep_file)',
+            '  return rctx.repo_metadata()',
+            (
+                'materializer_rule = repository_rule(_materializer_impl,'
+                ' attrs={"dep_file": attr.label()})'
+            ),
+        ],
+    )
+    self.ScratchFile(
+        'main/BUILD.bazel',
+        [
+            'genrule(',
+            '  name = "remote",',
+            '  srcs = ["@my_repo//:external_link.txt"],',
+            '  outs = ["remote.txt"],',
+            '  cmd = "cat $< > $@",',
+            '  tags = ["no-cache"],',
+            ')',
+            'genrule(',
+            '  name = "local",',
+            '  srcs = ["@my_repo//:external_link.txt"],',
+            '  outs = ["local.txt"],',
+            '  cmd = "cat $< > $@",',
+            '  tags = ["no-cache"],',
+            ')',
+        ],
+    )
+
+    # Populate the remote repo contents cache without creating an action-cache
+    # entry for either genrule.
+    _, _, stderr = self.RunBazel(['build', '@my_repo//:haha'])
+    stderr_text = '\n'.join(stderr)
+    self.assertIn('JUST FETCHED DEP_REPO', stderr_text)
+    self.assertIn('JUST FETCHED MY_REPO', stderr_text)
+
+    my_repo_dir = self.RepoDir('my_repo')
+    dep_repo_dir = self.RepoDir('dep_repo')
+    external_link = os.path.join(my_repo_dir, 'external_link.txt')
+
+    # Materialize only dep_repo in a fresh output base.
+    self.RunBazel(['clean', '--expunge'])
+    _, _, stderr = self.RunBazel(['build', '@materializer//:haha'])
+    self.assertNotIn('JUST FETCHED DEP_REPO', '\n'.join(stderr))
+    self.assertTrue(os.path.exists(os.path.join(dep_repo_dir, 'dep_data.txt')))
+    self.assertFalse(os.path.lexists(external_link))
+
+    # Restore my_repo into the in-memory overlay while leaving dep_repo on the
+    # native file system.
+    _, _, stderr = self.RunBazel(['build', '@my_repo//:haha'])
+    self.assertNotIn('JUST FETCHED MY_REPO', '\n'.join(stderr))
+    self.assertFalse(os.path.exists(os.path.join(my_repo_dir, 'BUILD')))
+    self.assertFalse(os.path.lexists(external_link))
+
+    # Remove the target contents from the CAS so remote input upload has to
+    # read through the overlay symlink instead of reusing the repository blob.
+    dep_digest = hashlib.sha256(b'dep_hello').hexdigest()
+    dep_blob = os.path.join(self._cas_path, 'cas', dep_digest[:2], dep_digest)
+    self.assertTrue(os.path.exists(dep_blob))
+    os.remove(dep_blob)
+
+    # A remote action must be able to upload the native target through the
+    # symlink path stored in the overlay.
+    _, _, stderr = self.RunBazel([
+        'build',
+        '//main:remote',
+        '--spawn_strategy=remote',
+        '--remote_executor=grpc://localhost:' + str(self._worker_port),
+    ])
+    self.assertNotIn('JUST FETCHED MY_REPO', '\n'.join(stderr))
+    self.assertTrue(os.path.exists(dep_blob))
+    with open(self.Path('bazel-bin/main/remote.txt')) as f:
+      self.assertEqual(f.read(), 'dep_hello')
+    self.assertFalse(os.path.exists(os.path.join(my_repo_dir, 'BUILD')))
+    self.assertFalse(os.path.lexists(external_link))
+
+    # A local action needs the original symlink on the host file system.
+    self.RunBazel([
+        'build',
+        '//main:local',
+        '--spawn_strategy=local',
+    ])
+    with open(self.Path('bazel-bin/main/local.txt')) as f:
+      self.assertEqual(f.read(), 'dep_hello')
+    self.assertFalse(os.path.exists(os.path.join(my_repo_dir, 'BUILD')))
+    self.assertTrue(os.path.islink(external_link))
+    with open(external_link) as f:
+      self.assertEqual(f.read(), 'dep_hello')
+
+  def testRepoExternalDirectorySymlinkWithNativeTargetRepo_glob(self):
+    if self.IsWindows():
+      self.ScratchFile(
+          '.bazelrc',
+          ['startup --windows_enable_symlinks'],
+          mode='a',
+      )
+    self.ScratchFile(
+        'MODULE.bazel',
+        [
+            'dep_repo_rule = use_repo_rule("//:dep_repo.bzl", "dep_repo_rule")',
+            'dep_repo_rule(name = "dep_repo")',
+            'repo = use_repo_rule("//:repo.bzl", "repo")',
+            (
+                'repo(name = "my_repo", external_file ='
+                ' "@dep_repo//:dep_dir/child.txt")'
+            ),
+            (
+                'materializer_rule ='
+                ' use_repo_rule("//:materializer.bzl", "materializer_rule")'
+            ),
+            (
+                'materializer_rule(name = "materializer", dep_file ='
+                ' "@dep_repo//:dep_dir/child.txt")'
+            ),
+        ],
+    )
+    self.ScratchFile('BUILD.bazel')
+    self.ScratchFile(
+        'dep_repo.bzl',
+        [
+            'def _dep_repo_impl(rctx):',
+            (
+                '  rctx.file("BUILD",'
+                " \"exports_files(['dep_dir/child.txt',"
+                " 'dep_dir/child_link.txt'])\")"
+            ),
+            '  rctx.file("dep_dir/child.txt", "dep_hello")',
+            '  rctx.symlink("dep_dir/child.txt", "dep_dir/child_link.txt")',
+            '  print("JUST FETCHED DEP_REPO")',
+            '  return rctx.repo_metadata(reproducible=True)',
+            'dep_repo_rule = repository_rule(_dep_repo_impl)',
+        ],
+    )
+    self.ScratchFile(
+        'repo.bzl',
+        [
+            'def _repo_impl(rctx):',
+            (
+                '  rctx.file("BUILD",'
+                " \"filegroup(name='haha',"
+                " srcs=glob(['linked_dir/*'], allow_empty=False))\\n"
+                "exports_files(['linked_dir/child.txt',"
+                " 'linked_dir/child_link.txt'])\")"
+            ),
+            (
+                '  rctx.symlink(rctx.path(rctx.attr.external_file).dirname,'
+                ' "linked_dir")'
+            ),
+            '  print("JUST FETCHED MY_REPO")',
+            '  return rctx.repo_metadata(reproducible=True)',
+            (
+                'repo = repository_rule(_repo_impl,'
+                ' attrs={"external_file": attr.label()})'
+            ),
+        ],
+    )
+    self.ScratchFile(
+        'main/BUILD.bazel',
+        [
+            'genrule(',
+            '  name = "regular_child",',
+            '  srcs = ["@my_repo//:linked_dir/child.txt"],',
+            '  outs = ["regular_child.txt"],',
+            '  cmd = "cat $< > $@",',
+            '  tags = ["no-cache"],',
+            ')',
+            'genrule(',
+            '  name = "symlink_child",',
+            '  srcs = ["@my_repo//:linked_dir/child_link.txt"],',
+            '  outs = ["symlink_child.txt"],',
+            '  cmd = "cat $< > $@",',
+            '  tags = ["no-cache"],',
+            ')',
+        ],
+    )
+    self.ScratchFile(
+        'materializer.bzl',
+        [
+            'def _materializer_impl(rctx):',
+            '  rctx.file("BUILD", "filegroup(name=\'haha\')")',
+            '  rctx.read(rctx.attr.dep_file)',
+            '  return rctx.repo_metadata()',
+            (
+                'materializer_rule = repository_rule(_materializer_impl,'
+                ' attrs={"dep_file": attr.label()})'
+            ),
+        ],
+    )
+
+    # Populate the remote repo contents cache with both repositories.
+    _, _, stderr = self.RunBazel(['build', '@my_repo//:haha'])
+    stderr_text = '\n'.join(stderr)
+    self.assertIn('JUST FETCHED DEP_REPO', stderr_text)
+    self.assertIn('JUST FETCHED MY_REPO', stderr_text)
+
+    my_repo_dir = self.RepoDir('my_repo')
+    dep_repo_dir = self.RepoDir('dep_repo')
+    linked_dir = os.path.join(my_repo_dir, 'linked_dir')
+
+    # Materialize only dep_repo in a fresh output base.
+    self.RunBazel(['clean', '--expunge'])
+    _, _, stderr = self.RunBazel(['build', '@materializer//:haha'])
+    self.assertNotIn('JUST FETCHED DEP_REPO', '\n'.join(stderr))
+    self.assertTrue(
+        os.path.exists(os.path.join(dep_repo_dir, 'dep_dir/child.txt'))
+    )
+    self.assertFalse(os.path.exists(os.path.join(my_repo_dir, 'BUILD')))
+    self.assertFalse(os.path.lexists(linked_dir))
+
+    # Restore my_repo into the overlay. Loading its package must glob through
+    # linked_dir into the natively materialized dep_repo.
+    _, _, stderr = self.RunBazel(['build', '@my_repo//:haha'])
+    stderr_text = '\n'.join(stderr)
+    self.assertNotIn('JUST FETCHED DEP_REPO', stderr_text)
+    self.assertNotIn('JUST FETCHED MY_REPO', stderr_text)
+    self.assertTrue(
+        os.path.exists(os.path.join(dep_repo_dir, 'dep_dir/child.txt'))
+    )
+    self.assertFalse(os.path.exists(os.path.join(my_repo_dir, 'BUILD')))
+    self.assertFalse(os.path.lexists(linked_dir))
+
+    # Local actions need the directory link and a final link below it reproduced
+    # on the host, while the source repository remains in the overlay.
+    self.RunBazel([
+        'build',
+        '//main:regular_child',
+        '//main:symlink_child',
+        '--spawn_strategy=local',
+    ])
+    with open(self.Path('bazel-bin/main/regular_child.txt')) as f:
+      self.assertEqual(f.read(), 'dep_hello')
+    with open(self.Path('bazel-bin/main/symlink_child.txt')) as f:
+      self.assertEqual(f.read(), 'dep_hello')
+    self.assertFalse(os.path.exists(os.path.join(my_repo_dir, 'BUILD')))
+    self.assertTrue(os.path.islink(linked_dir))
+    self.assertTrue(os.path.islink(os.path.join(linked_dir, 'child_link.txt')))
+    with open(os.path.join(linked_dir, 'child.txt')) as f:
+      self.assertEqual(f.read(), 'dep_hello')
+    with open(os.path.join(linked_dir, 'child_link.txt')) as f:
+      self.assertEqual(f.read(), 'dep_hello')
 
   def testLostRemoteFile_build(self):
     # Create a repo with two BUILD files (one in a subpackage), build a target
