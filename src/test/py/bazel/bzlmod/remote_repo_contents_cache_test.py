@@ -933,6 +933,81 @@ class RemoteRepoContentsCacheTest(test_base.TestBase):
   def testUseRepoFileInBuildRule_actionDoesNotUseCache(self):
     self.do_testUseRepoFileInBuildRule_actionDoesNotUseCache()
 
+  def testReproSourceDirectoryInputNotMaterializedForLocalAction(self):
+    """Reproduces a cached source directory appearing empty to a local action."""
+    self.ScratchFile(
+        'MODULE.bazel',
+        [
+            'repo = use_repo_rule("//:repo.bzl", "repo")',
+            'repo(name = "my_repo")',
+        ],
+    )
+    self.ScratchFile('BUILD.bazel')
+    self.ScratchFile(
+        'repo.bzl',
+        [
+            'def _repo_impl(rctx):',
+            '  rctx.file("BUILD.bazel", "filegroup(name=\'metadata_only\')")',
+            (
+                '  rctx.file("sysroot/BUILD.bazel",'
+                ' "filegroup(name=\'sysroot\', srcs=[\'.\'],'
+                ' visibility=[\'//visibility:public\'])")'
+            ),
+            '  rctx.file("sysroot/include/data.txt", "source-directory-data")',
+            '  print("JUST FETCHED")',
+            '  return rctx.repo_metadata(reproducible=True)',
+            'repo = repository_rule(_repo_impl)',
+        ],
+    )
+    self.ScratchFile(
+        'main/BUILD.bazel',
+        [
+            'genrule(',
+            '  name = "read_source_directory",',
+            '  srcs = ["@my_repo//sysroot:sysroot"],',
+            '  outs = ["out.txt"],',
+            (
+                '  cmd = "cat $(location @my_repo//sysroot:sysroot)/include/'
+                'data.txt > $@",'
+            ),
+            '  tags = ["no-cache"],',
+            ')',
+        ],
+    )
+
+    repo_dir = self.RepoDir('my_repo')
+
+    # Populate the repository cache and prove that the action itself is valid.
+    _, _, stderr = self.RunBazel([
+        'build',
+        '//main:read_source_directory',
+        '--spawn_strategy=local',
+    ])
+    self.assertIn('JUST FETCHED', '\n'.join(stderr))
+    with open(self.Path('bazel-bin/main/out.txt')) as f:
+      self.assertEqual(f.read(), 'source-directory-data')
+
+    # Restore the repository into the in-memory overlay, then force the action
+    # to run locally. The source directory is a single directory ActionInput.
+    # AbstractActionInputPrefetcher skips it, so none of its children are
+    # materialized into the native file system used by the sandbox.
+    self.RunBazel(['clean', '--expunge'])
+    exit_code, _, stderr = self.RunBazel(
+        [
+            'build',
+            '//main:read_source_directory',
+            '--spawn_strategy=local',
+        ],
+        allow_failure=True,
+    )
+    stderr = '\n'.join(stderr)
+    self.assertNotEqual(exit_code, 0)
+    self.assertNotIn('JUST FETCHED', stderr)
+    self.assertIn('No such file or directory', stderr)
+    self.assertFalse(
+        os.path.exists(os.path.join(repo_dir, 'sysroot/include/data.txt'))
+    )
+
   def testUseRepoFileInBuildRule_actionDoesNotUseCache_withExplicitSandboxBase(
       self,
   ):
@@ -1658,6 +1733,78 @@ class RemoteRepoContentsCacheTest(test_base.TestBase):
     self.assertFalse(os.path.exists(os.path.join(repo_dir, 'root.txt')))
     self.assertFalse(os.path.exists(os.path.join(repo_dir, 'sub/BUILD')))
     self.assertTrue(os.path.exists(os.path.join(repo_dir, 'sub/sub.txt')))
+
+  def testReproMissingLeafDuringFullRepoMaterializationIsFatal(self):
+    """Reproduces an evicted leaf turning materialization into a hard error."""
+    leaf_contents = b'unique-repository-leaf-for-materialization-repro'
+    self.ScratchFile(
+        'MODULE.bazel',
+        [
+            'repo = use_repo_rule("//:repo.bzl", "repo")',
+            'repo(name = "my_repo")',
+            'other_repo = use_repo_rule("//:other_repo.bzl", "other_repo")',
+            'other_repo(name = "other", data = "@my_repo//:data.txt")',
+        ],
+    )
+    self.ScratchFile('BUILD.bazel')
+    self.ScratchFile(
+        'repo.bzl',
+        [
+            'def _repo_impl(rctx):',
+            (
+                '  rctx.file("BUILD.bazel",'
+                ' "exports_files([\'data.txt\'])\\n'
+                'filegroup(name=\'metadata_only\')")'
+            ),
+            '  rctx.file("data.txt", "' + leaf_contents.decode() + '")',
+            '  print("JUST FETCHED")',
+            '  return rctx.repo_metadata(reproducible=True)',
+            'repo = repository_rule(_repo_impl)',
+        ],
+    )
+    self.ScratchFile(
+        'other_repo.bzl',
+        [
+            'def _other_repo_impl(rctx):',
+            '  rctx.file("BUILD.bazel", "filegroup(name=\'copy\')")',
+            '  rctx.file("copy.txt", rctx.read(rctx.path(rctx.attr.data)))',
+            '  return rctx.repo_metadata()',
+            (
+                'other_repo = repository_rule(_other_repo_impl,'
+                ' attrs={"data": attr.label()})'
+            ),
+        ],
+    )
+
+    repo_dir = self.RepoDir('my_repo')
+
+    # Populate the remote repository cache, then restore only the repository
+    # metadata into the overlay. data.txt remains remote-only.
+    _, _, stderr = self.RunBazel(['build', '@my_repo//:metadata_only'])
+    self.assertIn('JUST FETCHED', '\n'.join(stderr))
+    self.RunBazel(['clean', '--expunge'])
+    _, _, stderr = self.RunBazel(['build', '@my_repo//:metadata_only'])
+    self.assertNotIn('JUST FETCHED', '\n'.join(stderr))
+    self.assertFalse(os.path.exists(os.path.join(repo_dir, 'data.txt')))
+
+    # Keep the ActionResult and Tree but remove one leaf from CAS. A cache hit
+    # should now be treated as a repository-cache miss and refetched. Instead,
+    # full materialization through rctx.path/rctx.read propagates Missing digest
+    # as a hard error and does not re-run the repository rule.
+    self.DeleteCasEntry(leaf_contents)
+    exit_code, _, stderr = self.RunBazel(
+        [
+            'build',
+            '@other//:copy',
+            '--experimental_remote_cache_eviction_retries=0',
+        ],
+        allow_failure=True,
+    )
+    stderr = '\n'.join(stderr)
+    self.assertNotEqual(exit_code, 0)
+    self.assertNotIn('JUST FETCHED', stderr)
+    self.assertIn('Failed to materialize remote repo', stderr)
+    self.assertIn('Missing digest:', stderr)
 
   def doTestMaterializationWithInternalAndExternalSymlinks(
       self, *, expect_symlinks, watch_dep_file=True
