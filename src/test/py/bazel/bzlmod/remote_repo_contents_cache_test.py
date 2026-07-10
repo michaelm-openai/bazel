@@ -1790,13 +1790,13 @@ class RemoteRepoContentsCacheTest(test_base.TestBase):
     # Keep the ActionResult and Tree but remove one leaf from CAS. A cache hit
     # should now be treated as a repository-cache miss and refetched. Instead,
     # full materialization through rctx.path/rctx.read propagates Missing digest
-    # as a hard error and does not re-run the repository rule.
+    # as a hard error and does not re-run the repository rule, even with the
+    # default whole-command remote cache eviction retries.
     self.DeleteCasEntry(leaf_contents)
     exit_code, _, stderr = self.RunBazel(
         [
             'build',
             '@other//:copy',
-            '--experimental_remote_cache_eviction_retries=0',
         ],
         allow_failure=True,
     )
