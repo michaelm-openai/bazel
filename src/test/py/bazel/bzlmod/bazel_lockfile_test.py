@@ -2986,6 +2986,77 @@ class BazelLockfileTest(test_base.TestBase):
         stderr,
     )
 
+  def testReproServerRestartOverwritesReplacedLockfile(self):
+    """Reproduces a live server overwriting a newly checked-out lockfile."""
+    self.ScratchFile(
+        'MODULE.bazel',
+        [
+            'ext = use_extension("//:extension.bzl", "ext")',
+            'use_repo(ext, "hello")',
+        ],
+    )
+    self.ScratchFile('BUILD.bazel')
+    extension_contents = [
+        'def _repo_impl(ctx):',
+        '    ctx.file("BUILD.bazel", "filegroup(name=\'hello\')")',
+        'repo = repository_rule(implementation = _repo_impl)',
+        'def _ext_impl(ctx):',
+        '    repo(name = "hello")',
+        (
+            '    return ctx.extension_metadata('
+            'facts = {"value": "from-old-server"})'
+        ),
+        'ext = module_extension(implementation = _ext_impl)',
+    ]
+    self.ScratchFile('extension.bzl', extension_contents)
+
+    # The server reads the empty lockfile, evaluates the extension, and writes
+    # its result. Its evaluator still holds the pre-update lockfile value.
+    self.RunBazel(
+        [
+            '--idle_server_tasks',
+            'build',
+            '--lockfile_mode=update',
+            '@hello//:all',
+        ]
+    )
+    with open(self.Path('MODULE.bazel.lock'), 'r') as f:
+      old_lockfile_contents = f.read()
+    self.assertIn('from-old-server', old_lockfile_contents)
+
+    # A second output base stands in for a checkout which has a different,
+    # valid lockfile while the original server is still alive.
+    replacement_output_base = tempfile.mkdtemp(dir=self._tests_root)
+    self.ScratchFile(
+        'extension.bzl',
+        [
+            line.replace('from-old-server', 'checked-out-lockfile')
+            for line in extension_contents
+        ],
+    )
+    self.RunBazel(
+        [
+            f'--output_base={replacement_output_base}',
+            '--batch',
+            'build',
+            '--lockfile_mode=update',
+            '@hello//:all',
+        ]
+    )
+    with open(self.Path('MODULE.bazel.lock'), 'r') as f:
+      replacement_lockfile_contents = f.read()
+    self.assertIn('checked-out-lockfile', replacement_lockfile_contents)
+    self.assertNotEqual(old_lockfile_contents, replacement_lockfile_contents)
+
+    # Changing a startup option forces the original server to shut down, just
+    # like a Bazel version change. Its afterCommand rewrites the workspace
+    # lockfile before the new info command's lockfile_mode=off can take effect.
+    self.RunBazel(['--noidle_server_tasks', 'info', '--lockfile_mode=off'])
+    with open(self.Path('MODULE.bazel.lock'), 'r') as f:
+      actual_lockfile_contents = f.read()
+    self.assertEqual(old_lockfile_contents, actual_lockfile_contents)
+    self.assertNotEqual(replacement_lockfile_contents, actual_lockfile_contents)
+
   def testFactsInNonReproducibleExtension(self):
     self.ScratchFile(
         'MODULE.bazel',
